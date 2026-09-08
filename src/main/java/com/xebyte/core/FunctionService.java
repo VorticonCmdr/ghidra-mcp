@@ -7,6 +7,8 @@ import ghidra.app.plugin.core.clear.ClearFlowAndRepairCmd;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.listing.Bookmark;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
@@ -2766,10 +2768,15 @@ public class FunctionService {
      * @param startAddress Starting address in hex format (e.g., "0x6fb4ca14")
      * @param endAddress Optional ending address in hex format (exclusive)
      * @param length Optional length in bytes (alternative to endAddress)
-     * @param restrictToExecuteMemory If true, restricts disassembly to executable memory (default: true)
+     * @param restrictToExecuteMemory If true, restrict disassembly to this program's executable,
+     *        non-external memory blocks (default: true) - built as an explicit restrictedSet and
+     *        passed to DisassembleCommand, not conflated with flow-following.
+     * @param followFlow If true, disassemble beyond the requested range wherever flow (calls,
+     *        jumps, fallthrough) leads. Off by default: a range request should disassemble that
+     *        range, not open-endedly explore the program from it.
      * @return JSON result with disassembly status
      */
-    @McpTool(path = "/disassemble_bytes", method = "POST", description = "Disassemble a range of bytes. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. Returns the disassembled instruction text (mnemonic + operands + bytes) when `include_instructions` is true (default), so callers working on custom processor definitions (#205) can read back what Ghidra produced without a follow-up call.", category = "function")
+    @McpTool(path = "/disassemble_bytes", method = "POST", description = "Disassemble a range of bytes. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. Returns the disassembled instruction text (mnemonic + operands + bytes) when `include_instructions` is true (default), so callers working on custom processor definitions (#205) can read back what Ghidra produced without a follow-up call. By default this disassembles only the requested range and only within executable memory - pass follow_flow=true to let disassembly continue beyond the range wherever a call, jump, or fallthrough leads, which can extend well past start/end.", category = "function")
     public Response disassembleBytes(
             @Param(value = "start_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -2784,7 +2791,14 @@ public class FunctionService {
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String endAddress,
             @Param(value = "length", source = ParamSource.BODY, defaultValue = "0") Integer length,
-            @Param(value = "restrict_to_execute_memory", source = ParamSource.BODY, defaultValue = "true") boolean restrictToExecuteMemory,
+            @Param(value = "restrict_to_execute_memory", source = ParamSource.BODY, defaultValue = "true",
+                   description = "Restrict disassembly to this program's executable, non-external "
+                               + "memory blocks. Does not affect whether disassembly follows flow "
+                               + "outside the requested range - see follow_flow for that.") boolean restrictToExecuteMemory,
+            @Param(value = "follow_flow", source = ParamSource.BODY, defaultValue = "false",
+                   description = "If true, disassembly follows flow (calls, jumps, fallthrough) "
+                               + "beyond the requested start/end range instead of stopping at it. "
+                               + "Off by default so a range request stays bounded to that range.") boolean followFlow,
             @Param(value = "include_instructions", source = ParamSource.BODY, defaultValue = "true",
                    description = "Return the disassembled instruction list (mnemonic, operands, raw bytes, address) in the response. Disable for byte ranges where you only need the success/byte-count summary.") boolean includeInstructions,
             @Param(value = "max_instructions", source = ParamSource.BODY, defaultValue = "1000",
@@ -2885,9 +2899,29 @@ public class FunctionService {
                     AddressSet addressSet = new AddressSet(start, end);
                     long numBytes = addressSet.getNumAddresses();
 
-                    // Execute disassembly
+                    // Build an explicit restrictedSet from this program's executable,
+                    // non-external memory blocks when requested. DisassembleCommand's second
+                    // constructor argument IS this restriction; passing null here (as before)
+                    // means "no restriction," which is not what restrict_to_execute_memory=true
+                    // (the default) was documented to mean.
+                    AddressSetView restrictedSet = null;
+                    if (restrictToExecuteMemory) {
+                        Memory memory = program.getMemory();
+                        AddressSet execMemory = new AddressSet();
+                        for (MemoryBlock block : memory.getBlocks()) {
+                            if (block.isExecute() && !block.isExternalBlock()) {
+                                execMemory.add(block.getStart(), block.getEnd());
+                            }
+                        }
+                        restrictedSet = execMemory;
+                    }
+
+                    // Execute disassembly. followFlow is now its own honestly-named parameter -
+                    // previously restrictToExecuteMemory was passed here directly, so the
+                    // documented-safe default (true) silently turned on unbounded flow-following
+                    // with no restriction at all, inside a committed transaction.
                     DisassembleCommand cmd =
-                        new DisassembleCommand(addressSet, null, restrictToExecuteMemory);
+                        new DisassembleCommand(addressSet, restrictedSet, followFlow);
 
                     // Prevent auto-analysis cascade
                     cmd.setSeedContext(null);
@@ -2998,13 +3032,13 @@ public class FunctionService {
      */
     public Response disassembleBytes(String startAddress, String endAddress, Integer length,
                                    boolean restrictToExecuteMemory) {
-        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
+        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory, false,
                                 true, 1000, null);
     }
 
     public Response disassembleBytes(String startAddress, String endAddress, Integer length,
                                    boolean restrictToExecuteMemory, String programName) {
-        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
+        return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory, false,
                                 true, 1000, programName);
     }
 

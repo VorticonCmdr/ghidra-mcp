@@ -951,6 +951,7 @@
         "end_address",
         "length",
         "restrict_to_execute_memory",
+        "follow_flow",
         "include_instructions",
         "max_instructions",
         "program"
