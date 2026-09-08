@@ -1292,13 +1292,16 @@ public class XrefCallGraphService {
     // -----------------------------------------------------------------------
 
     /**
-     * Retrieve xrefs for multiple addresses in one call
+     * Retrieve xrefs for multiple addresses in one call. Each address in the result is an
+     * object carrying either its references or the reason it didn't resolve - a bare empty
+     * array previously meant both "resolved, zero references" and "never resolved," making a
+     * genuine negative indistinguishable from a caller mistake.
      */
     public Response getBulkXrefs(Object addressesObj) {
         return getBulkXrefs(addressesObj, null);
     }
 
-    @McpTool(path = "/get_bulk_xrefs", method = "POST", description = "Batch cross-reference retrieval", category = "xref")
+    @McpTool(path = "/get_bulk_xrefs", method = "POST", description = "Batch cross-reference retrieval: incoming references (who calls/reads/writes each address) for many addresses in one call. Each requested address maps to its own result object - either {address, references, count} or {address, error} when the address string didn't resolve. A zero-reference result and an unresolved-address result are never the same shape: treat an unresolved address as a signal to re-check the spelling, not as \"nothing references this.\"", category = "xref")
     public Response getBulkXrefs(
             @Param(value = "addresses", source = ParamSource.BODY) Object addressesObj,
             @Param(value = "program", defaultValue = "") String programName) {
@@ -1327,32 +1330,53 @@ public class XrefCallGraphService {
             ReferenceManager refMgr = program.getReferenceManager();
             Map<String, Object> resultMap = new LinkedHashMap<>();
 
+            // Each entry is an object, not a bare array (matching getAssemblyContext's own
+            // per-address shape below) - a caller needs to be able to tell "zero real
+            // references" from "this address string didn't resolve to anything in the
+            // program" without a second round trip. Previously both cases produced an
+            // identical empty array, which is exactly the silent-zero failure mode this
+            // endpoint's single-address siblings (getXrefsTo/getXrefsFrom) already avoid
+            // by returning an error instead of a confident empty result.
             for (String addrStr : addresses) {
-                List<Map<String, Object>> refsList = new ArrayList<>();
-
                 try {
                     Address addr = ServiceUtils.parseAddress(program, addrStr);
-                    if (addr != null) {
-                        ReferenceIterator refIter = refMgr.getReferencesTo(addr);
-
-                        while (refIter.hasNext()) {
-                            Reference ref = refIter.next();
-                            Address fromAddr = ref.getFromAddress();
-                            Map<String, Object> refItem = new LinkedHashMap<>();
-                            refItem.put("from", fromAddr.toString(false));
-                            if (ServiceUtils.getPhysicalSpaceCount(program) > 1) {
-                                refItem.put("from_full", fromAddr.toString());
-                                refItem.put("from_space", fromAddr.getAddressSpace().getName());
-                            }
-                            refItem.put("type", ref.getReferenceType().getName());
-                            refsList.add(refItem);
-                        }
+                    if (addr == null) {
+                        resultMap.put(addrStr, JsonHelper.mapOf(
+                            "address", addrStr,
+                            "error", ServiceUtils.getLastParseError()
+                        ));
+                        continue;
                     }
-                } catch (Exception e) {
-                    // Address parsing failed, return empty array
-                }
 
-                resultMap.put(addrStr, refsList);
+                    List<Map<String, Object>> refsList = new ArrayList<>();
+                    ReferenceIterator refIter = refMgr.getReferencesTo(addr);
+                    while (refIter.hasNext()) {
+                        Reference ref = refIter.next();
+                        Address fromAddr = ref.getFromAddress();
+                        Map<String, Object> refItem = new LinkedHashMap<>();
+                        refItem.put("from", fromAddr.toString(false));
+                        if (ServiceUtils.getPhysicalSpaceCount(program) > 1) {
+                            refItem.put("from_full", fromAddr.toString());
+                            refItem.put("from_space", fromAddr.getAddressSpace().getName());
+                        }
+                        refItem.put("type", ref.getReferenceType().getName());
+                        refsList.add(refItem);
+                    }
+                    resultMap.put(addrStr, JsonHelper.mapOf(
+                        "address", addrStr,
+                        "references", refsList,
+                        "count", refsList.size()
+                    ));
+                } catch (Exception e) {
+                    // Genuine fault building this one address's references (not a parse
+                    // failure - parseAddress returns null rather than throwing, handled
+                    // above). Report it per-address rather than aborting the whole batch
+                    // or silently degrading to an empty array either way.
+                    resultMap.put(addrStr, JsonHelper.mapOf(
+                        "address", addrStr,
+                        "error", e.getMessage() != null ? e.getMessage() : e.toString()
+                    ));
+                }
             }
 
             return Response.ok(resultMap);
