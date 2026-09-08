@@ -154,7 +154,7 @@ public class FunctionService {
      * Decompile a function at the given address.
      * If programName is provided, uses that program instead of the current one.
      */
-    @McpTool(path = "/decompile_function", description = "Decompile ONE function (address) OR MANY (functions=comma-separated names/addresses) to pseudocode. On programs with multiple address spaces, prefix addresses with the space name (mem:1000). Replaces batch_decompile.", category = "function")
+    @McpTool(path = "/decompile_function", description = "Decompile ONE function (address) OR MANY (functions=comma-separated names/addresses) to pseudocode. On programs with multiple address spaces, prefix addresses with the space name (mem:1000). Single mode returns {name, address, decompiled}. Bulk mode returns {results, count, total, truncated} - results is one object per requested function ({function, status, name, address, decompiled} on success, {function, status, error} on failure), never a bare string, so a per-function failure can't be mistaken for decompiled code. Capped at 20 functions per call; a longer list sets truncated=true with a note rather than silently dropping the rest. Replaces batch_decompile.", category = "function")
     public Response decompileFunctionByAddress(
             @Param(value = "address", paramType = "address", defaultValue = "",
                    description = "Function address or name (single mode). 0x<hex> or <space>:<hex>. Omit when using functions=.") String addressStr,
@@ -340,42 +340,73 @@ public class FunctionService {
 
         try {
             String[] functionRefs = functionsParam.split(",");
-            Map<String, Object> resultMap = new LinkedHashMap<>();
             final int MAX_FUNCTIONS = 20; // Limit to prevent overload
+            final boolean truncated = functionRefs.length > MAX_FUNCTIONS;
+
+            // A named-plural-key envelope with count/total/truncated, per this repo's own
+            // MCP_RESPONSE_CONTRACT.md and matching decompileFunctionByAddress's single-mode
+            // {name, address, decompiled} shape for each entry - not the flat
+            // {funcRef: decompiledCodeOrErrorString} map this used to return. That old shape
+            // had nowhere to put "total" (a truncated batch was indistinguishable from a
+            // complete one) and reported per-function failures as ordinary string values
+            // beginning "Error: " rather than as errors, so a caller scanning for a marker
+            // saw a clean success either way.
+            List<Map<String, Object>> results = new ArrayList<>();
 
             for (int i = 0; i < functionRefs.length && i < MAX_FUNCTIONS; i++) {
                 String funcRef = functionRefs[i].trim();
                 if (funcRef.isEmpty()) continue;
 
-                Function function = ServiceUtils.resolveFunction(program, funcRef);
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("function", funcRef);
 
+                Function function = ServiceUtils.resolveFunction(program, funcRef);
                 if (function == null) {
-                    resultMap.put(funcRef, "Error: Function not found");
+                    row.put("status", "error");
+                    row.put("error", "Function not found");
+                    results.add(row);
                     continue;
                 }
 
-                // Decompile the function
                 DecompInterface decompiler = null;
                 try {
                     decompiler = ServiceUtils.createConfiguredDecompiler(program);
                     DecompileResults decompResults = decompiler.decompileFunction(function, 30, null);
 
                     if (decompResults != null && decompResults.decompileCompleted()) {
-                        String decompCode = decompResults.getDecompiledFunction().getC();
-                        resultMap.put(funcRef, decompCode);
+                        row.put("status", "ok");
+                        row.put("name", function.getName());
+                        row.put("address", function.getEntryPoint().toString(false));
+                        row.put("decompiled", decompResults.getDecompiledFunction().getC());
                     } else {
-                        resultMap.put(funcRef, "Error: Decompilation failed");
+                        row.put("status", "error");
+                        String errorMsg = decompResults != null ? decompResults.getErrorMessage() : null;
+                        row.put("error", "Decompilation failed"
+                                + (errorMsg != null && !errorMsg.isBlank() ? ": " + errorMsg : ""));
                     }
                 } catch (Exception e) {
-                    resultMap.put(funcRef, "Error: " + e.getMessage());
+                    row.put("status", "error");
+                    row.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
                 } finally {
                     if (decompiler != null) {
                         try { decompiler.dispose(); } catch (Exception ignored) {}
                     }
                 }
+                results.add(row);
             }
 
-            return Response.ok(resultMap);
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("results", results);
+            out.put("count", results.size());
+            out.put("total", functionRefs.length);
+            out.put("truncated", truncated);
+            if (truncated) {
+                out.put("truncation_note", "MAX_FUNCTIONS=" + MAX_FUNCTIONS + " reached; "
+                        + (functionRefs.length - MAX_FUNCTIONS) + " requested function(s) were "
+                        + "not decompiled. Split into multiple calls of " + MAX_FUNCTIONS
+                        + " or fewer.");
+            }
+            return Response.ok(out);
         } catch (Exception e) {
             return Response.err(e.getMessage());
         }
