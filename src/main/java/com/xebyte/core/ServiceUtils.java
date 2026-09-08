@@ -247,6 +247,17 @@ public final class ServiceUtils {
      * @param limit  maximum items to return; {@code <= 0} means "no limit"
      */
     public static Response paged(String key, List<?> all, int offset, int limit) {
+        return paged(key, all, offset, limit, null);
+    }
+
+    /**
+     * Same envelope as {@link #paged(String, List, int, int)}, with additional top-level
+     * fields merged in - e.g. what address a query actually resolved into, so an empty
+     * page doesn't read as "nothing exists here" when it might mean "you asked about the
+     * wrong address." {@code extra} entries are added after the standard paging fields
+     * and may overwrite them if a key collides; pass {@code null} for none.
+     */
+    public static Response paged(String key, List<?> all, int offset, int limit, Map<String, Object> extra) {
         int start = Math.max(0, offset);
         int end = (limit > 0) ? Math.min(all.size(), start + limit) : all.size();
         List<?> page = (start >= all.size()) ? List.of() : all.subList(start, end);
@@ -259,6 +270,9 @@ public final class ServiceUtils {
             out.put("limit", limit);
         }
         out.put("total", all.size());
+        if (extra != null) {
+            out.putAll(extra);
+        }
         return Response.ok(out);
     }
 

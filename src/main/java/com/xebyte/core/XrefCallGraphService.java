@@ -3,6 +3,7 @@ package com.xebyte.core;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 
 import java.util.*;
@@ -30,7 +31,7 @@ public class XrefCallGraphService {
     /**
      * Get all references to a specific address (xref to)
      */
-    @McpTool(path = "/get_xrefs_to", description = "Get cross-references to an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "xref")
+    @McpTool(path = "/get_xrefs_to", description = "Get cross-references to an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always names the memory block the queried address resolved into (`block`, or null if it isn't backed by any block) - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart. Check it before recording \"no references found.\"", category = "xref")
     public Response getXrefsTo(
             @Param(value = "address", paramType = "address",
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -71,8 +72,18 @@ public class XrefCallGraphService {
             }
 
             // An empty result is a normal outcome, not an error: callers read
-            // count==0 rather than parsing an English sentence.
-            return ServiceUtils.paged("references", refs, offset, limit);
+            // count==0 rather than parsing an English sentence. But a genuine zero and a
+            // wrong-but-parseable address both produce count==0 with no other signal, so
+            // resolution feedback is not optional here - it's what tells the two apart.
+            Map<String, Object> resolution = new LinkedHashMap<>();
+            resolution.put("resolved_address", addr.toString(false));
+            if (ServiceUtils.getPhysicalSpaceCount(program) > 1) {
+                resolution.put("resolved_address_full", addr.toString());
+                resolution.put("resolved_space", addr.getAddressSpace().getName());
+            }
+            MemoryBlock block = program.getMemory().getBlock(addr);
+            resolution.put("block", block != null ? block.getName() : null);
+            return ServiceUtils.paged("references", refs, offset, limit, resolution);
         } catch (Exception e) {
             return Response.err("Error getting references to address: " + e.getMessage());
         }
@@ -81,7 +92,7 @@ public class XrefCallGraphService {
     /**
      * Get all references from a specific address (xref from)
      */
-    @McpTool(path = "/get_xrefs_from", description = "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "xref")
+    @McpTool(path = "/get_xrefs_from", description = "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always names the memory block the queried address resolved into (`block`, or null if it isn't backed by any block) - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart.", category = "xref")
     public Response getXrefsFrom(
             @Param(value = "address", paramType = "address",
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -123,12 +134,20 @@ public class XrefCallGraphService {
                 refs.add(String.format("To %s%s [%s]", toAddr, targetInfo, refType.getName()));
             }
 
-            // Return meaningful message if no references found
-            if (refs.isEmpty()) {
-                return ServiceUtils.paged("references", refs, offset, limit);
+            // Resolution feedback, same reasoning as get_xrefs_to: a genuine zero and a
+            // wrong-but-parseable address both produce count==0 with nothing else to tell
+            // them apart. The old "if refs.isEmpty()" branch here was dead code - both arms
+            // called paged() identically - left as though a distinct empty-result message
+            // existed when it never did.
+            Map<String, Object> resolution = new LinkedHashMap<>();
+            resolution.put("resolved_address", addr.toString(false));
+            if (ServiceUtils.getPhysicalSpaceCount(program) > 1) {
+                resolution.put("resolved_address_full", addr.toString());
+                resolution.put("resolved_space", addr.getAddressSpace().getName());
             }
-
-            return ServiceUtils.paged("references", refs, offset, limit);
+            MemoryBlock block = program.getMemory().getBlock(addr);
+            resolution.put("block", block != null ? block.getName() : null);
+            return ServiceUtils.paged("references", refs, offset, limit, resolution);
         } catch (Exception e) {
             return Response.err("Error getting references from address: " + e.getMessage());
         }
