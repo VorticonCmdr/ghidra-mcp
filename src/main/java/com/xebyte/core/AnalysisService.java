@@ -760,13 +760,6 @@ public class AnalysisService {
         }
     }
 
-    /**
-     * Search for byte patterns with optional wildcards
-     */
-    public Response searchBytePatterns(String pattern, String mask) {
-        return searchBytePatterns(pattern, mask, null);
-    }
-
     @McpTool(path = "/search_byte_patterns", description = "Search for byte patterns with masks", category = "analysis")
     public Response searchBytePatterns(
             @Param(value = "pattern", description = "Hex byte pattern") String pattern,

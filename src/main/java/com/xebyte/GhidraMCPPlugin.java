@@ -2869,13 +2869,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     }
 
     /**
-     * Search for byte patterns with optional wildcards
-     */
-    private String searchBytePatterns(String pattern, String mask) {
-        return analysisService.searchBytePatterns(pattern, mask).toJson();
-    }
-
-    /**
      * Find functions structurally similar to the target function
      * Uses basic block count, instruction count, call count, and cyclomatic complexity
      */
