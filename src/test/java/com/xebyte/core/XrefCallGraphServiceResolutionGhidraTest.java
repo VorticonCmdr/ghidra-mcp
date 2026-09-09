@@ -24,9 +24,11 @@ import static org.junit.Assume.assumeTrue;
  * Regression coverage for the get_xrefs_to / get_xrefs_from resolution-feedback fix: a
  * wrong-but-parseable address and a genuine zero-reference address used to be
  * indistinguishable - both returned count=0 with nothing else to tell them apart. The
- * response now always names the memory block the queried address resolved into, so
- * "count=0, block=null" (nothing backs this address at all) reads differently from
- * "count=0, block=.text" (a real location, genuinely no references).
+ * response now always reports in_memory_block, so "count=0, in_memory_block=false" (nothing
+ * backs this address at all) reads differently from "count=0, in_memory_block=true,
+ * block=.text" (a real location, genuinely no references). The signal is a boolean rather
+ * than a nullable block name because Gson drops null values, so "block": null would never
+ * have reached the caller at all.
  */
 public class XrefCallGraphServiceResolutionGhidraTest {
 
@@ -84,6 +86,7 @@ public class XrefCallGraphServiceResolutionGhidraTest {
         Map<String, Object> b = body(service().getXrefsTo("0x1004", 0, 100, ""));
         assertEquals(1, b.get("count"));
         assertEquals("0x1004", b.get("resolved_address"));
+        assertEquals(Boolean.TRUE, b.get("in_memory_block"));
         assertEquals(".text", b.get("block"));
     }
 
@@ -92,18 +95,23 @@ public class XrefCallGraphServiceResolutionGhidraTest {
         // Inside the mapped block, genuinely zero references - a real negative.
         Map<String, Object> zeroButReal = body(service().getXrefsTo("0x1050", 0, 100, ""));
         assertEquals(0, zeroButReal.get("count"));
+        assertEquals(Boolean.TRUE, zeroButReal.get("in_memory_block"));
         assertEquals("a real address's block must be reported even with zero references - "
                 + "this is what a genuine negative looks like",
             ".text", zeroButReal.get("block"));
 
         // Not inside any memory block at all - the exact case this fix exists to surface.
-        // Same count=0 as above, but block is null, which is the only thing that tells them
-        // apart. Before this fix neither response carried any resolution info at all.
+        // Same count=0 as above; in_memory_block is the only thing that tells them apart.
+        // Before this fix neither response carried any resolution info at all.
         Map<String, Object> unbacked = body(service().getXrefsTo("0x50000", 0, 100, ""));
         assertEquals(0, unbacked.get("count"));
-        assertNull("an address with no covering memory block must report block=null, "
+        // in_memory_block is the load-bearing assertion: Gson drops null values, so a
+        // "block": null would vanish from the payload and assertNull here would pass on a
+        // field the caller never actually receives.
+        assertEquals("an address with no covering memory block must say so explicitly, "
                 + "distinguishing it from a real address that just has no references",
-            unbacked.get("block"));
+            Boolean.FALSE, unbacked.get("in_memory_block"));
+        assertNull(unbacked.get("block"));
     }
 
     @Test
@@ -111,10 +119,12 @@ public class XrefCallGraphServiceResolutionGhidraTest {
         Map<String, Object> b = body(service().getXrefsFrom("0x1000", 0, 100, ""));
         assertEquals(1, b.get("count"));
         assertEquals("0x1000", b.get("resolved_address"));
+        assertEquals(Boolean.TRUE, b.get("in_memory_block"));
         assertEquals(".text", b.get("block"));
 
         Map<String, Object> unbacked = body(service().getXrefsFrom("0x50000", 0, 100, ""));
         assertEquals(0, unbacked.get("count"));
+        assertEquals(Boolean.FALSE, unbacked.get("in_memory_block"));
         assertNull(unbacked.get("block"));
     }
 }

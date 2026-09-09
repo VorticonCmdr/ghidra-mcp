@@ -31,7 +31,7 @@ public class XrefCallGraphService {
     /**
      * Get all references to a specific address (xref to)
      */
-    @McpTool(path = "/get_xrefs_to", description = "Get cross-references to an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always names the memory block the queried address resolved into (`block`, or null if it isn't backed by any block) - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart. Check it before recording \"no references found.\"", category = "xref")
+    @McpTool(path = "/get_xrefs_to", description = "Get cross-references to an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always reports `in_memory_block`, and `block` names the block when there is one - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart. Check it before recording \"no references found.\"", category = "xref")
     public Response getXrefsTo(
             @Param(value = "address", paramType = "address",
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -81,8 +81,16 @@ public class XrefCallGraphService {
                 resolution.put("resolved_address_full", addr.toString());
                 resolution.put("resolved_space", addr.getAddressSpace().getName());
             }
+            // in_memory_block is the always-present signal, and block only appears when
+            // there is one. JsonHelper's Gson has no serializeNulls(), so a null value is
+            // dropped from the payload entirely: "block": null never reaches the wire, and
+            // an absent key is a weaker signal than an explicit one for the exact question
+            // this field exists to answer.
             MemoryBlock block = program.getMemory().getBlock(addr);
-            resolution.put("block", block != null ? block.getName() : null);
+            resolution.put("in_memory_block", block != null);
+            if (block != null) {
+                resolution.put("block", block.getName());
+            }
             return ServiceUtils.paged("references", refs, offset, limit, resolution);
         } catch (Exception e) {
             return Response.err("Error getting references to address: " + e.getMessage());
@@ -92,7 +100,7 @@ public class XrefCallGraphService {
     /**
      * Get all references from a specific address (xref from)
      */
-    @McpTool(path = "/get_xrefs_from", description = "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always names the memory block the queried address resolved into (`block`, or null if it isn't backed by any block) - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart.", category = "xref")
+    @McpTool(path = "/get_xrefs_from", description = "Get cross-references from an address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution. The response always reports `in_memory_block`, and `block` names the block when there is one - a wrong-but-parseable address returns a clean, confident count of 0 exactly like a real negative, and this is the one signal that tells them apart.", category = "xref")
     public Response getXrefsFrom(
             @Param(value = "address", paramType = "address",
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -145,8 +153,16 @@ public class XrefCallGraphService {
                 resolution.put("resolved_address_full", addr.toString());
                 resolution.put("resolved_space", addr.getAddressSpace().getName());
             }
+            // in_memory_block is the always-present signal, and block only appears when
+            // there is one. JsonHelper's Gson has no serializeNulls(), so a null value is
+            // dropped from the payload entirely: "block": null never reaches the wire, and
+            // an absent key is a weaker signal than an explicit one for the exact question
+            // this field exists to answer.
             MemoryBlock block = program.getMemory().getBlock(addr);
-            resolution.put("block", block != null ? block.getName() : null);
+            resolution.put("in_memory_block", block != null);
+            if (block != null) {
+                resolution.put("block", block.getName());
+            }
             return ServiceUtils.paged("references", refs, offset, limit, resolution);
         } catch (Exception e) {
             return Response.err("Error getting references from address: " + e.getMessage());
