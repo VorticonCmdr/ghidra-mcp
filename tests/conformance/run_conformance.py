@@ -115,11 +115,23 @@ def main() -> int:
         print(f"  {len(tools)} tools registered")
 
         if args.generate:
-            schema = json.loads(
-                transport.call_tool("mcp_schema", {}, timeout=60).text or "{}"
-            )
-            schema_tools = schema.get("tools") or []
+            # mcp_schema is richer than list_tools (it carries param source and
+            # param_type), so prefer it -- but it is not always callable. The
+            # bridge registers tools from whichever /mcp/schema its connected
+            # transport serves, and the UDS schema omits the utility category
+            # that mcp_schema lives in, so over UDS the call comes back
+            # "Unknown tool: mcp_schema" -- an error string, not JSON. Parsing
+            # it unconditionally raised JSONDecodeError here and killed
+            # --generate outright, which is what the fallback below already
+            # existed to prevent.
+            schema_tools = []
+            probe = transport.call_tool("mcp_schema", {}, timeout=60)
+            if not probe.is_error:
+                schema = probe.json() or {}
+                schema_tools = schema.get("tools") or []
             if not schema_tools:
+                print("  mcp_schema unavailable; falling back to list_tools "
+                      f"({probe.text.strip()[:80]})")
                 schema_tools = [{"path": "/" + t["name"], "params": [
                     {"name": k, "required": k in (t.get("inputSchema", {}).get("required") or [])}
                     for k in (t.get("inputSchema", {}).get("properties") or {})
