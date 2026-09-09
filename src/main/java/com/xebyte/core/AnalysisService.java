@@ -840,7 +840,7 @@ public class AnalysisService {
         return (c >= '0' && c <= '9') ? c - '0' : c - 'A' + 10;
     }
 
-    @McpTool(path = "/search_byte_patterns", description = "Search program memory for a hex byte pattern, including bytes Ghidra never disassembled. Wildcards go inside the pattern: ?? matches any byte, and a single nibble can be wildcarded on either side (E8 ?? ?? ?? ??, FF D?, ?5 8B). Whitespace is optional. There is no separate mask parameter.", category = "analysis")
+    @McpTool(path = "/search_byte_patterns", description = "Search program memory for a hex byte pattern, including bytes Ghidra never disassembled. Wildcards go inside the pattern: ?? matches any byte, and a single nibble can be wildcarded on either side (E8 ?? ?? ?? ??, FF D?, ?5 8B). Whitespace is optional. There is no separate mask parameter. Returns {matches, count, total, truncated, max_matches} plus coverage counters (blocks_searched, blocks_uninitialized, blocks_read_failed, bytes_searched): count is what came back, total is what exists, and a nonzero blocks_read_failed means part of the program was not searched, so a zero result is not evidence of absence.", category = "analysis")
     public Response searchBytePatterns(
             @Param(value = "pattern", description = "Hex byte pattern, e.g. \"55 8B EC\" or \"E8 ?? ?? ?? ??\" or \"FF D?\". Two hex digits per byte; ? wildcards a nibble.") String pattern,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
@@ -860,9 +860,21 @@ public class AnalysisService {
             Memory memory = program.getMemory();
             List<Map<String, Object>> matches = new ArrayList<>();
             final int MAX_MATCHES = 1000;
+            // Coverage counters. A search that never looked at part of the program must not
+            // be able to answer "no matches" as though it had: on the binary this was checked
+            // against, 30 of 88 blocks and 40% of the byte footprint are skipped, and the
+            // response used to be byte-identical to a complete scan.
+            int blocksSearched = 0;
+            int blocksUninitialized = 0;
+            int blocksReadFailed = 0;
+            long bytesSearched = 0;
+            long total = 0;
 
             for (MemoryBlock block : memory.getBlocks()) {
-                if (!block.isInitialized()) continue;
+                if (!block.isInitialized()) {
+                    blocksUninitialized++;
+                    continue;
+                }
 
                 Address blockStart = block.getStart();
                 long blockSize = block.getSize();
@@ -871,8 +883,16 @@ public class AnalysisService {
                 try {
                     block.getBytes(blockStart, blockData);
                 } catch (Exception e) {
+                    // A block with real bytes that could not be read is a hole in the search,
+                    // not a benign skip. Count it separately and say so in the log; the
+                    // exception used to be bound here and silently discarded.
+                    blocksReadFailed++;
+                    Msg.warn(this, "search_byte_patterns: could not read block "
+                            + block.getName() + " at " + blockStart + ": " + e.getMessage());
                     continue;
                 }
+                blocksSearched++;
+                bytesSearched += blockData.length;
 
                 for (int i = 0; i <= blockData.length - patternBytes.length; i++) {
                     boolean matchFound = true;
@@ -890,24 +910,34 @@ public class AnalysisService {
                     }
 
                     if (matchFound) {
-                        Address matchAddr = blockStart.add(i);
-                        matches.add(ServiceUtils.addressToJson(matchAddr, program));
-
-                        if (matches.size() >= MAX_MATCHES) {
-                            matches.add(JsonHelper.mapOf("note", "Limited to " + MAX_MATCHES + " matches"));
-                            break;
+                        total++;
+                        // Keep counting past the cap, stop appending. total is what makes a
+                        // truncated result distinguishable from a complete one, and the old
+                        // code broke out of both loops so the real figure was unknowable.
+                        if (matches.size() < MAX_MATCHES) {
+                            matches.add(ServiceUtils.addressToJson(blockStart.add(i), program));
                         }
                     }
                 }
-
-                if (matches.size() >= MAX_MATCHES) break;
             }
 
-            if (matches.isEmpty()) {
-                matches.add(JsonHelper.mapOf("note", "No matches found"));
-            }
-
-            return Response.ok(matches);
+            // An object, not a bare array. MCP_RESPONSE_CONTRACT.md section 1a: "A bare JSON
+            // array is not valid. It has nowhere to put total, so a truncated result is
+            // indistinguishable from a complete one." That missing envelope is why both the
+            // "No matches found" and "Limited to N matches" signals used to be smuggled into
+            // the item array as pseudo-matches, which made zero matches arrive as a length-1
+            // truthy array and broke any caller reading result[i]["address"].
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("matches", matches);
+            out.put("count", matches.size());
+            out.put("total", total);
+            out.put("truncated", total > MAX_MATCHES);
+            out.put("max_matches", MAX_MATCHES);
+            out.put("blocks_searched", blocksSearched);
+            out.put("blocks_uninitialized", blocksUninitialized);
+            out.put("blocks_read_failed", blocksReadFailed);
+            out.put("bytes_searched", bytesSearched);
+            return Response.ok(out);
         } catch (Exception e) {
             return Response.err(e.getMessage());
         }
