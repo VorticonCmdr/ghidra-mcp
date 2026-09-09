@@ -760,45 +760,102 @@ public class AnalysisService {
         }
     }
 
-    @McpTool(path = "/search_byte_patterns", description = "Search for byte patterns with masks", category = "analysis")
+    /**
+     * A parsed hex search pattern: per-byte value and per-byte mask, both nibble-granular.
+     * mask entries are 0x00 (byte is a wildcard), 0x0F / 0xF0 (one nibble fixed) or 0xFF.
+     * A non-null {@code error} means the pattern was rejected and value/mask are null.
+     *
+     * <p>Package-private, and deliberately separate from the search itself, so the parsing
+     * rules can be tested without a loaded program.
+     */
+    record ParsedPattern(int[] value, int[] mask, String error) {
+        static ParsedPattern rejected(String message) {
+            return new ParsedPattern(null, null, message);
+        }
+        boolean failed() {
+            return error != null;
+        }
+    }
+
+    /** Maximum pattern length. A longer pattern is a mistake, not a search. */
+    static final int MAX_PATTERN_BYTES = 256;
+
+    /**
+     * Parse a hex byte pattern into value/mask arrays, rejecting anything malformed rather
+     * than quietly searching for something the caller did not write. The previous parser
+     * accepted an odd digit count and read the trailing nibble as a whole byte, so "9E E5 D"
+     * searched for 9E E5 0D and confidently reported no matches against memory holding
+     * 9E E5 DD - a one-character slip became a clean negative.
+     */
+    static ParsedPattern parseBytePattern(String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            return ParsedPattern.rejected("pattern is required");
+        }
+        // Whitespace is free-form and stripped; "5 5 8B" has always been accepted. '.' is
+        // taken as a synonym for '?' because Ghidra's own hex search spells wildcards that way.
+        String clean = pattern.trim().toUpperCase().replaceAll("\\s+", "").replace('.', '?');
+        if (clean.isEmpty()) {
+            return ParsedPattern.rejected("pattern is required");
+        }
+
+        for (int i = 0; i < clean.length(); i++) {
+            char c = clean.charAt(i);
+            boolean ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || c == '?';
+            if (!ok) {
+                return ParsedPattern.rejected("pattern contains '" + c + "' at index " + i
+                        + "; only hex digits 0-9 A-F and ? wildcards are allowed");
+            }
+        }
+
+        if (clean.length() % 2 != 0) {
+            return ParsedPattern.rejected("pattern has " + clean.length()
+                    + " hex digits; each byte needs 2 (use ? for an unknown nibble)");
+        }
+
+        int len = clean.length() / 2;
+        if (len > MAX_PATTERN_BYTES) {
+            return ParsedPattern.rejected("pattern is " + len + " bytes; the maximum is "
+                    + MAX_PATTERN_BYTES);
+        }
+
+        if (clean.indexOf('?') >= 0 && clean.chars().allMatch(c -> c == '?')) {
+            return ParsedPattern.rejected(
+                    "every nibble is a wildcard; that matches at every address");
+        }
+
+        int[] value = new int[len];
+        int[] mask = new int[len];
+        for (int b = 0; b < len; b++) {
+            char hi = clean.charAt(b * 2);
+            char lo = clean.charAt(b * 2 + 1);
+            boolean hiWild = hi == '?';
+            boolean loWild = lo == '?';
+            value[b] = ((hiWild ? 0 : hexDigit(hi)) << 4) | (loWild ? 0 : hexDigit(lo));
+            mask[b] = (hiWild ? 0x00 : 0xF0) | (loWild ? 0x00 : 0x0F);
+        }
+        return new ParsedPattern(value, mask, null);
+    }
+
+    private static int hexDigit(char c) {
+        return (c >= '0' && c <= '9') ? c - '0' : c - 'A' + 10;
+    }
+
+    @McpTool(path = "/search_byte_patterns", description = "Search program memory for a hex byte pattern, including bytes Ghidra never disassembled. Wildcards go inside the pattern: ?? matches any byte, and a single nibble can be wildcarded on either side (E8 ?? ?? ?? ??, FF D?, ?5 8B). Whitespace is optional. There is no separate mask parameter.", category = "analysis")
     public Response searchBytePatterns(
-            @Param(value = "pattern", description = "Hex byte pattern") String pattern,
-            @Param(value = "mask", description = "Pattern mask (omit or leave empty for exact match)", defaultValue = "") String mask,
+            @Param(value = "pattern", description = "Hex byte pattern, e.g. \"55 8B EC\" or \"E8 ?? ?? ?? ??\" or \"FF D?\". Two hex digits per byte; ? wildcards a nibble.") String pattern,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
 
-        if (pattern == null || pattern.trim().isEmpty()) {
-            return Response.err("Pattern is required");
+        ParsedPattern parsed = parseBytePattern(pattern);
+        if (parsed.failed()) {
+            return Response.err(parsed.error());
         }
+        final int[] patternBytes = parsed.value();
+        final int[] maskBytes = parsed.mask();
 
         try {
-            // Parse hex pattern (e.g., "E8 ?? ?? ?? ??" or "E8????????")
-            String cleanPattern = pattern.trim().toUpperCase().replaceAll("\\s+", "");
-
-            // Convert pattern to byte array and mask
-            int patternLen = cleanPattern.replace("?", "").length() / 2 + cleanPattern.replace("?", "").length() % 2;
-            if (cleanPattern.contains("?")) {
-                patternLen = cleanPattern.length() / 2;
-            }
-
-            byte[] patternBytes = new byte[patternLen];
-            byte[] maskBytes = new byte[patternLen];
-
-            int byteIndex = 0;
-            for (int i = 0; i < cleanPattern.length(); i += 2) {
-                if (cleanPattern.charAt(i) == '?' || (i + 1 < cleanPattern.length() && cleanPattern.charAt(i + 1) == '?')) {
-                    patternBytes[byteIndex] = 0;
-                    maskBytes[byteIndex] = 0;
-                } else {
-                    String hexByte = cleanPattern.substring(i, Math.min(i + 2, cleanPattern.length()));
-                    patternBytes[byteIndex] = (byte) Integer.parseInt(hexByte, 16);
-                    maskBytes[byteIndex] = (byte) 0xFF;
-                }
-                byteIndex++;
-            }
-
             // Search memory for pattern
             Memory memory = program.getMemory();
             List<Map<String, Object>> matches = new ArrayList<>();
@@ -820,7 +877,13 @@ public class AnalysisService {
                 for (int i = 0; i <= blockData.length - patternBytes.length; i++) {
                     boolean matchFound = true;
                     for (int j = 0; j < patternBytes.length; j++) {
-                        if (maskBytes[j] != 0 && blockData[i + j] != patternBytes[j]) {
+                        // Nibble-granular compare. maskBytes[j] is 0x00/0x0F/0xF0/0xFF, so the
+                        // AND also strips the sign extension from the byte-to-int promotion.
+                        // The old form was "mask != 0 && data != value", a whole-byte equality
+                        // behind a boolean gate: it could only ever express "this byte matters"
+                        // or "it does not", so a half-specified byte like FF D? silently
+                        // widened to FF ?? and over-matched.
+                        if (((blockData[i + j] ^ patternBytes[j]) & maskBytes[j]) != 0) {
                             matchFound = false;
                             break;
                         }

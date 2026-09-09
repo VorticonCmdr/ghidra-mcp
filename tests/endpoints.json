@@ -2260,7 +2260,6 @@
       "category": "search",
       "params": [
         "pattern",
-        "mask",
         "program"
       ],
       "description": "Search for byte patterns"
