@@ -4,7 +4,50 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
-## v7.0.0 (unreleased) — major: tool consolidation, JSON response contract, MCP conformance suite, an offline test tier, and a release gate that can actually block
+## Unreleased
+
+### Fork integration — upstream 7.0.0 plus selected development fixes
+
+- Integrate upstream v7.0.0, including save/transaction fixes, program targeting,
+  shared GUI/headless services, MCP conformance, and the consolidated API.
+- Preserve bounded disassembly with an independent `follow_flow` switch, strict
+  byte-pattern parsing, search coverage counters, and conformance schema-error handling.
+- Carry bulk cross-reference diagnostics to `get_xrefs_to(addresses=...)`: each
+  address has a result object or error, with explicit memory-mapping information.
+- Carry honest bulk truncation to `get_functions`: `total` counts all nonempty
+  inputs, `requested` counts processed inputs, `count` counts successful reads,
+  and `truncated` is always explicit. Per-function errors remain structured.
+- Adapt fork regression tests to the shared program API, and resolve macOS
+  temporary-directory symlinks in the shared-project containment test.
+- See [the fork migration notes](docs/project-management/FORK_UPSTREAM_7_INTEGRATION.md)
+  for API changes and validation.
+
+### Fixed — integer and object-array parameters no longer bind lossily
+
+- Integer parameters reject fractional, out-of-range and missing required values
+  instead of truncating them or binding 0. An empty value (`?limit=`) still means
+  "not given" and uses the parameter's default.
+- Object-array parameters reject entries that are not objects instead of
+  silently dropping them.
+- Malformed values fail before the tool runs. This is adapted to the stable
+  server's parameter binding; the broader typed-entity refactor stays on upstream dev.
+
+### Performance — `get_functions` opens one decompiler per call (#575)
+
+Every decompile in a `get_functions` call -- each target and each caller decompiled for
+`call_context` -- used to open and dispose its own `DecompInterface` (~238 ms to open, 5-10 ms
+per decompile on an open one), so a 20-function bulk read with call context opened one per
+target plus one per (target, caller) pair. The call now opens one decompiler on first use,
+reuses it for the whole request in single and bulk mode, and disposes it before returning; a
+`fields=` subset that decompiles nothing opens none. Results are kept per entry point for the
+request, so a caller shared by several targets is decompiled once. A decompile that does not
+complete (timeout, dead process, exception) disposes the interface and the next one reopens,
+so one bad function cannot fail the rest of a bulk call. Options and the 12 s per-decompile
+timeout are unchanged, and so is every response field. Measured on the real-Ghidra tier
+(`RequestScopedDecompilerGhidraTest`, 20 leaf targets + 10 shared callers,
+`fields=decompiled_code,call_context`): 14.5 s -> 0.32 s.
+
+## v7.0.0 (2026-10-21) — major: tool consolidation, JSON response contract, MCP conformance suite, an offline test tier, and a release gate that can actually block
 
 **209 tools** — 205 served by the GUI plugin, 190 by the headless server, 186
 by both. The advertised surface went from 272 → 251 in the first consolidation

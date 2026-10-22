@@ -1,12 +1,13 @@
 package com.xebyte.core;
 
 import com.xebyte.headless.DirectThreadingStrategy;
-import com.xebyte.headless.HeadlessProgramProvider;
 import ghidra.GhidraApplicationLayout;
 import ghidra.framework.Application;
 import ghidra.framework.ApplicationConfiguration;
 import ghidra.program.database.ProgramBuilder;
 import ghidra.program.database.ProgramDB;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.Instruction;
 import org.junit.After;
 import org.junit.Before;
@@ -49,6 +50,7 @@ public class FunctionServiceDisassembleBytesGhidraTest {
         builder = new ProgramBuilder("disassemble-bytes", ProgramBuilder._X64, "gcc", this);
         program = builder.getProgram();
         builder.createMemory(".text", "0x1000", 0x1100);
+        builder.withTransaction(() -> program.getMemory().getBlock(".text").setExecute(true));
 
         // Requested range: 0x1000-0x1004 is a near CALL to 0x2000.
         // CALL 0x2000 (5 bytes)
@@ -66,8 +68,12 @@ public class FunctionServiceDisassembleBytesGhidraTest {
 
     @Test
     public void defaultsStayWithinTheRequestedRange() {
-        HeadlessProgramProvider provider = new HeadlessProgramProvider();
-        provider.setCurrentProgram(program);
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
         FunctionService service = new FunctionService(provider, new DirectThreadingStrategy());
 
         // follow_flow defaults to false via the back-compat overload used by the
@@ -84,8 +90,12 @@ public class FunctionServiceDisassembleBytesGhidraTest {
 
     @Test
     public void followFlowExplicitlyRequestedReachesTheCallTarget() {
-        HeadlessProgramProvider provider = new HeadlessProgramProvider();
-        provider.setCurrentProgram(program);
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
         FunctionService service = new FunctionService(provider, new DirectThreadingStrategy());
 
         Response response = service.disassembleBytes("0x1000", null, 5, true, true, true, 1000, "");
@@ -97,8 +107,12 @@ public class FunctionServiceDisassembleBytesGhidraTest {
 
     @Test
     public void restrictToExecuteMemoryFalseDoesNotImplyFollowFlow() {
-        HeadlessProgramProvider provider = new HeadlessProgramProvider();
-        provider.setCurrentProgram(program);
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
         FunctionService service = new FunctionService(provider, new DirectThreadingStrategy());
 
         // Before the fix, restrict_to_execute_memory alone controlled followFlow.
@@ -109,5 +123,32 @@ public class FunctionServiceDisassembleBytesGhidraTest {
         assertTrue(response.toJson(), response instanceof Response.Ok);
         assertNull("restrict_to_execute_memory=false must not imply follow_flow=true",
             program.getListing().getInstructionAt(builder.addr("0x2000")));
+    }
+
+    @Test
+    public void aFailedNestedDisassemblyDoesNotDiscardTheCallersEarlierEdits() throws Exception {
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
+        FunctionService service = new FunctionService(provider, new DirectThreadingStrategy());
+        Response initial = service.disassembleBytes("0x1000", null, 5, true);
+        assertTrue(initial.toJson(), initial instanceof Response.Ok);
+        int outer = program.startTransaction("earlier analyst edits");
+        boolean committed = false;
+        try {
+            program.getSymbolTable().createLabel(builder.addr("0x1000"),
+                "keep_earlier_edit", SourceType.USER_DEFINED);
+            // Auto-detecting an already-disassembled instruction fails inside WriteTx.
+            Response response = service.disassembleBytes("0x1000", null, null, true);
+            assertTrue(response.toJson(), response instanceof Response.Err);
+            committed = true;
+        } finally {
+            program.endTransaction(outer, committed);
+        }
+        assertNotNull("a failed nested write must preserve the enclosing transaction",
+            program.getSymbolTable().getGlobalSymbol("keep_earlier_edit", builder.addr("0x1000")));
     }
 }

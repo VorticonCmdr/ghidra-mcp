@@ -542,8 +542,7 @@ public class AnnotationScanner {
 
         } else if (type == int.class) {
             int defaultVal = hasDef ? parseIntSafe(def, 0) : 0;
-            if (value == null || value.isEmpty()) return defaultVal;
-            return parseIntSafe(value, defaultVal);
+            return exactInt(value, defaultVal, hasDef, binding.param.value());
 
         } else if (type == Integer.class) {
             if (value == null || value.isEmpty()) {
@@ -579,6 +578,8 @@ public class AnnotationScanner {
             long defaultVal = hasDef ? parseLongSafe(def, 0L) : 0L;
             if (value == null || value.isEmpty()) return defaultVal;
             return parseLongSafe(value, defaultVal);
+        } else if (type == List.class) {
+            return requireMapList(value);
         }
         return value;
     }
@@ -599,7 +600,7 @@ public class AnnotationScanner {
 
         // Special: fieldsJson conversion (serialize complex objects to JSON string)
         if (binding.param.fieldsJson()) {
-            return convertFieldsJson(raw);
+            return raw == null && hasDef ? def : convertFieldsJson(raw);
         }
 
         if (type == String.class) {
@@ -608,7 +609,7 @@ public class AnnotationScanner {
 
         } else if (type == int.class) {
             int defaultVal = hasDef ? parseIntSafe(def, 0) : 0;
-            return JsonHelper.getInt(raw, defaultVal);
+            return exactInt(raw, defaultVal, hasDef, binding.param.value());
 
         } else if (type == Integer.class) {
             if (raw == null) {
@@ -652,7 +653,7 @@ public class AnnotationScanner {
             return convertStringMap(body, binding.param.value());
 
         } else if (type == List.class) {
-            return ServiceUtils.convertToMapList(raw);
+            return requireMapList(raw);
 
         } else if (type == Object.class) {
             return raw;
@@ -663,6 +664,39 @@ public class AnnotationScanner {
     // ==================================================================
     // Type conversion helpers
     // ==================================================================
+
+    private static int exactInt(Object value, int defaultValue, boolean hasDefault, String name) {
+        // An empty query value ("?limit=") means "not given", as it always did.
+        boolean absent = value == null || value instanceof String text && text.isEmpty();
+        if (absent && hasDefault) return defaultValue;
+        try {
+            if (value instanceof Number || value instanceof String) {
+                return new java.math.BigDecimal(value.toString()).intValueExact();
+            }
+        } catch (NumberFormatException | ArithmeticException ignored) {
+        }
+        throw new IllegalArgumentException(name + " must be a signed 32-bit integer");
+    }
+
+    private static List<Map<String, String>> requireMapList(Object value) {
+        if (value == null) return null;
+        if (value instanceof String text) {
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseString(text);
+            if (!parsed.isJsonArray()) throw new IllegalArgumentException("Expected an array of objects");
+            int index = 0;
+            for (com.google.gson.JsonElement item : parsed.getAsJsonArray()) {
+                if (!item.isJsonObject()) throw new IllegalArgumentException("Item " + index + " must be an object");
+                index++;
+            }
+            return JsonHelper.toMapStringList(parsed);
+        }
+        if (!(value instanceof List<?> items)) throw new IllegalArgumentException("Expected an array of objects");
+        for (int index = 0; index < items.size(); index++) {
+            if (!(items.get(index) instanceof Map<?, ?>))
+                throw new IllegalArgumentException("Item " + index + " must be an object");
+        }
+        return ServiceUtils.convertToMapList(value);
+    }
 
     private static String convertFieldsJson(Object obj) {
         if (obj == null) return null;

@@ -16,6 +16,7 @@ import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.mem.Memory;
 import ghidra.program.model.lang.InjectPayload;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.pcode.Varnode;
@@ -71,7 +72,8 @@ public class FunctionService {
     //   Swing deadlock threshold per decompile. Pathological functions that
     //   need >12s are treated as "too complex to score" — an acceptable
     //   trade since they also pin the HTTP thread pool under any longer cap.
-    private static final int NO_RETRY_DECOMPILE_TIMEOUT_SECONDS = 12;
+    //   Package-private so /get_functions' request-scoped decompiler uses the same cap.
+    static final int NO_RETRY_DECOMPILE_TIMEOUT_SECONDS = 12;
 
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
@@ -3320,7 +3322,8 @@ Map<String, Object> out = new LinkedHashMap<>();
                                + "embedded/microcontroller targets — are not address-space-agnostic; "
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String endAddress,
-            @Param(value = "length", source = ParamSource.BODY, defaultValue = "0") Integer length,
+            @Param(value = "length", source = ParamSource.BODY, defaultValue = "0",
+                   description = "Number of bytes from start_address; end_address wins when supplied. Zero auto-detects undefined bytes with a 100-byte cap.") Integer length,
             @Param(value = "restrict_to_execute_memory", source = ParamSource.BODY, defaultValue = "true",
                    description = "Restrict disassembly to this program's executable, non-external "
                                + "memory blocks. Does not affect whether disassembly follows flow "
@@ -3333,7 +3336,8 @@ Map<String, Object> out = new LinkedHashMap<>();
                    description = "Return the disassembled instruction list (mnemonic, operands, raw bytes, address) in the response. Disable for byte ranges where you only need the success/byte-count summary.") boolean includeInstructions,
             @Param(value = "max_instructions", source = ParamSource.BODY, defaultValue = "1000",
                    description = "Cap on number of instructions returned when include_instructions is true. Protects against runaway payload for large ranges; if the actual count exceeds this, the response sets truncated=true and instructions_total reports the real count.") int maxInstructions,
-            @Param(value = "program", defaultValue = "") String programName) {
+            @Param(value = "program", defaultValue = "",
+                   description = "Target program name; omit to use the active program.") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -3361,8 +3365,8 @@ Map<String, Object> out = new LinkedHashMap<>();
                      (length != null ? " with length " + length : "") +
                      (endAddress != null ? " to " + endAddress : ""));
 
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Disassemble Bytes");
+            threadingStrategy.runOnUi(() -> {
+                WriteTx tx = WriteTx.begin(program, "Disassemble Bytes");
                 boolean success = false;
 
                 try {
@@ -3530,7 +3534,7 @@ Map<String, Object> out = new LinkedHashMap<>();
                     errorMsg.set("Exception during disassembly: " + msg);
                     Msg.error(this, "disassembleBytes: Exception during disassembly", e);
                 } finally {
-                    program.endTransaction(tx, success);
+                    tx.end(success);
                 }
             });
 
@@ -3563,13 +3567,13 @@ Map<String, Object> out = new LinkedHashMap<>();
     public Response disassembleBytes(String startAddress, String endAddress, Integer length,
                                    boolean restrictToExecuteMemory) {
         return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
-                                true, 1000, null);
+                                false, true, 1000, null);
     }
 
     public Response disassembleBytes(String startAddress, String endAddress, Integer length,
                                    boolean restrictToExecuteMemory, String programName) {
         return disassembleBytes(startAddress, endAddress, length, restrictToExecuteMemory,
-                                true, 1000, programName);
+                                false, true, 1000, programName);
     }
 
     // ========================================================================

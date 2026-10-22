@@ -28,18 +28,7 @@ public class XrefCallGraphService {
     // Xref Methods
     // -----------------------------------------------------------------------
 
-    /**
-     * Get all references to a specific address (xref to)
-     */
-    /**
-     * The many-at-once form of {@link #getXrefsTo}: a map from each requested address to its
-     * references. Was a separate POST tool (get_bulk_xrefs) answering the exact same question
-     * with getReferencesTo, which meant a caller had to know two tools and two response shapes
-     * to ask "who references this" about one address versus five.
-     *
-     * <p>An address that fails to resolve yields an empty list rather than failing the call —
-     * the batch is the point, and one bad entry should not lose the other ninety-nine.
-     */
+    /** Bulk incoming references, with an independent result or error for each address. */
     private Response xrefsToMany(Program program, String addressesCsv) {
         ReferenceManager refMgr = program.getReferenceManager();
         boolean qualify = ServiceUtils.getPhysicalSpaceCount(program) > 1;
@@ -47,9 +36,14 @@ public class XrefCallGraphService {
         for (String raw : addressesCsv.split(",")) {
             String addrStr = raw.trim();
             if (addrStr.isEmpty()) continue;
-            List<Map<String, Object>> refs = new ArrayList<>();
-            Address addr = ServiceUtils.parseAddress(program, addrStr);
-            if (addr != null) {
+            try {
+                Address addr = ServiceUtils.parseAddress(program, addrStr);
+                if (addr == null) {
+                    byAddress.put(addrStr, JsonHelper.mapOf("address", addrStr,
+                        "error", ServiceUtils.getLastParseError()));
+                    continue;
+                }
+                List<Map<String, Object>> refs = new ArrayList<>();
                 ReferenceIterator it = refMgr.getReferencesTo(addr);
                 while (it.hasNext()) {
                     Reference ref = it.next();
@@ -67,8 +61,23 @@ public class XrefCallGraphService {
                     }
                     refs.add(entry);
                 }
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("address", addrStr);
+                result.put("resolved_address", addr.toString(false));
+                if (qualify) {
+                    result.put("resolved_address_full", addr.toString());
+                    result.put("resolved_space", addr.getAddressSpace().getName());
+                }
+                MemoryBlock block = program.getMemory().getBlock(addr);
+                result.put("in_memory_block", block != null);
+                if (block != null) result.put("block", block.getName());
+                result.put("references", refs);
+                result.put("count", refs.size());
+                byAddress.put(addrStr, result);
+            } catch (Exception e) {
+                byAddress.put(addrStr, JsonHelper.mapOf("address", addrStr,
+                    "error", e.getMessage() != null ? e.getMessage() : e.toString()));
             }
-            byAddress.put(addrStr, refs);
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("references_by_address", byAddress);
@@ -90,8 +99,8 @@ public class XrefCallGraphService {
                                + "address is unambiguous.") String addressStr,
             @Param(value = "addresses", defaultValue = "",
                    description = "Comma-separated addresses for the many-at-once form. The result is a "
-                               + "map of address to its reference list, and an address that does not "
-                               + "resolve gets an empty list rather than failing the whole call.") String addressesCsv,
+                               + "map of address to {references, count, resolved_address, in_memory_block, block}. "
+                               + "An address that does not resolve gets {address, error}; other entries still run.") String addressesCsv,
             @Param(value = "offset", defaultValue = "0",
                    description = "Number of entries to skip before this page starts; 0 begins at the "
                                + "first entry. Page by adding `limit` each call until offset reaches the "

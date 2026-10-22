@@ -1053,10 +1053,10 @@ Available on the standalone headless server (`GhidraMCPHeadlessServer`).
 - `create_function` - Create function at address
 - `delete_function` - Delete function at address
 - `delete_function_tag` - Delete a program-wide function tag definition
-- `disassemble_bytes` - Disassemble byte range
+- `disassemble_bytes` - Disassemble a byte range, restricted to executable memory by default
 - `disassemble_function` - Disassemble function
 - `force_decompile` - Force fresh decompilation (output stamped with language_id + variant; optional variant= is checked against the loaded one)
-- `get_functions` - Everything about one or many functions in a single call
+- `get_functions` - Read one function or up to 20 in bulk, selecting fields to avoid unneeded decompilation
 - `list_class_members` - List the member functions of a C++ class
 - `list_function_tags` - List all program-wide function tag definitions with their use counts
 - `remove_function_tag` - Detach one or more tags from a function
@@ -1084,8 +1084,8 @@ Available on the standalone headless server (`GhidraMCPHeadlessServer`).
 - `get_assembly_context` - Get assembly context
 - `get_full_call_graph` - Get full call graph
 - `get_function_call_graph` - Get call graph
-- `get_xrefs_from` - Get references from address
-- `get_xrefs_to` - Get references to address
+- `get_xrefs_from` - Get outgoing references with resolved_address and in_memory_block; block names mapped memory
+- `get_xrefs_to` - Get incoming references to one address or comma-separated addresses
 - `remove_reference` - Remove memory cross-reference(s) from one address to another — the inverse of add_memory_reference
 
 ### Data Types & Structures
@@ -1150,7 +1150,7 @@ Available on the standalone headless server (`GhidraMCPHeadlessServer`).
 - `inspect_memory_content` - Inspect memory bytes
 - `list_analyzers` - List available analysis plugins
 - `run_analysis` - Run auto-analysis on the current program
-- `search_byte_patterns` - Search for byte patterns
+- `search_byte_patterns` - Search memory for hex bytes with nibble wildcards (?5, D?, ??)
 - `search_instructions` - Search for instructions by mnemonic and/or operand substring
 
 ### Malware & Anti-Analysis

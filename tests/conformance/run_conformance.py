@@ -56,9 +56,12 @@ def probe_facts(transport, program: str, second: str) -> ProgramFacts:
     rebuilt, and a suite that hardcodes them fails for a reason that has
     nothing to do with the server.
     """
-    listing = transport.call_tool("list_functions_enhanced",
+    listing = transport.call_tool("find_functions",
                                   {"program": program, "limit": 40}, timeout=90)
-    functions = (listing.json() or {}).get("functions") or []
+    parsed_listing = listing.json()
+    if listing.is_error or not isinstance(parsed_listing, dict):
+        raise SystemExit(f"cannot discover functions in {program}: {listing.text[:200]}")
+    functions = parsed_listing.get("functions") or []
     real = [f for f in functions if not f.get("is_thunk") and not f.get("is_external")]
     if not real:
         raise SystemExit(f"no non-thunk functions found in {program}; cannot generate cases")
@@ -183,8 +186,9 @@ def main() -> int:
             schema_tools = []
             probe = transport.call_tool("mcp_schema", {}, timeout=60)
             if not probe.is_error:
-                schema = probe.json() or {}
-                schema_tools = schema.get("tools") or []
+                schema = probe.json()
+                if isinstance(schema, dict):
+                    schema_tools = schema.get("tools") or []
             if not schema_tools:
                 print("  mcp_schema unavailable; falling back to list_tools "
                       f"({probe.text.strip()[:80]})")

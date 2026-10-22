@@ -1,12 +1,12 @@
 package com.xebyte.core;
 
 import com.xebyte.headless.DirectThreadingStrategy;
-import com.xebyte.headless.HeadlessProgramProvider;
 import ghidra.GhidraApplicationLayout;
 import ghidra.framework.Application;
 import ghidra.framework.ApplicationConfiguration;
 import ghidra.program.database.ProgramBuilder;
 import ghidra.program.database.ProgramDB;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.SourceType;
 import org.junit.After;
@@ -76,16 +76,20 @@ public class XrefCallGraphServiceResolutionGhidraTest {
     }
 
     private XrefCallGraphService service() {
-        HeadlessProgramProvider provider = new HeadlessProgramProvider();
-        provider.setCurrentProgram(program);
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
         return new XrefCallGraphService(provider, new DirectThreadingStrategy());
     }
 
     @Test
     public void xrefsToRealReferenceReportsItsBlock() {
-        Map<String, Object> b = body(service().getXrefsTo("0x1004", 0, 100, ""));
+        Map<String, Object> b = body(service().getXrefsTo("0x1004", "", 0, 100, ""));
         assertEquals(1, b.get("count"));
-        assertEquals("0x1004", b.get("resolved_address"));
+        assertEquals(builder.addr("0x1004").toString(false), b.get("resolved_address"));
         assertEquals(Boolean.TRUE, b.get("in_memory_block"));
         assertEquals(".text", b.get("block"));
     }
@@ -93,7 +97,7 @@ public class XrefCallGraphServiceResolutionGhidraTest {
     @Test
     public void xrefsToRealLocationWithNoReferencesStaysDistinctFromUnbackedAddress() {
         // Inside the mapped block, genuinely zero references - a real negative.
-        Map<String, Object> zeroButReal = body(service().getXrefsTo("0x1050", 0, 100, ""));
+        Map<String, Object> zeroButReal = body(service().getXrefsTo("0x1050", "", 0, 100, ""));
         assertEquals(0, zeroButReal.get("count"));
         assertEquals(Boolean.TRUE, zeroButReal.get("in_memory_block"));
         assertEquals("a real address's block must be reported even with zero references - "
@@ -103,7 +107,7 @@ public class XrefCallGraphServiceResolutionGhidraTest {
         // Not inside any memory block at all - the exact case this fix exists to surface.
         // Same count=0 as above; in_memory_block is the only thing that tells them apart.
         // Before this fix neither response carried any resolution info at all.
-        Map<String, Object> unbacked = body(service().getXrefsTo("0x50000", 0, 100, ""));
+        Map<String, Object> unbacked = body(service().getXrefsTo("0x50000", "", 0, 100, ""));
         assertEquals(0, unbacked.get("count"));
         // in_memory_block is the load-bearing assertion: Gson drops null values, so a
         // "block": null would vanish from the payload and assertNull here would pass on a
@@ -118,7 +122,7 @@ public class XrefCallGraphServiceResolutionGhidraTest {
     public void xrefsFromAlsoReportsResolution() {
         Map<String, Object> b = body(service().getXrefsFrom("0x1000", 0, 100, ""));
         assertEquals(1, b.get("count"));
-        assertEquals("0x1000", b.get("resolved_address"));
+        assertEquals(builder.addr("0x1000").toString(false), b.get("resolved_address"));
         assertEquals(Boolean.TRUE, b.get("in_memory_block"));
         assertEquals(".text", b.get("block"));
 

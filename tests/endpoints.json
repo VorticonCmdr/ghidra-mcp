@@ -1228,7 +1228,7 @@
         "gui",
         "headless"
       ],
-      "description": "Disassemble byte range"
+      "description": "Disassemble a byte range, restricted to executable memory by default. follow_flow is independent and defaults to false, keeping disassembly within the requested range."
     },
     {
       "path": "/disassemble_function",
@@ -1734,7 +1734,7 @@
         "gui",
         "headless"
       ],
-      "description": "Everything about one or many functions in a single call. Pass functions= as a comma-separated list of names or addresses for bulk mode (up to 20); omit it and pass function=/name=/address= for one. Pass fields= as a comma-separated subset to skip work you do not need — omitted or empty returns everything. When the requested fields need no decompiled text (e.g. fields=callers,callees,signature,labels,entry_point), the target function is NOT decompiled (238 ms cold / 5–10 ms warm per function); only decompiled_code (and call_context when enabled) pays that cost. Decompiled text renders EOL comments (// style), so comments written with set_comment are visible in the code. Replaces get_function_by_address, get_function_variables, get_function_xrefs, decompile_function, and the former get_function_callers/callees/labels/signature tools. Completeness scoring is NOT included — call analyze_function_completeness for that. A bundle carrying decompiled_code or call_context is stamped with language_id + variant (in bulk mode, every entry), and on a processor whose variants load different SLEIGH decoders (PowerPC vs PowerPC VLE) also carries variant_ambiguous + variant_candidates; pass variant= to have that assumption checked: naming a variant the program is not loaded under is refused."
+      "description": "Read one function or up to 20 in bulk, selecting fields to avoid unneeded decompilation. Bulk responses include functions, count (successful reads), requested (processed inputs), total (all nonempty inputs), and truncated. One configured decompiler is reused within each request."
     },
     {
       "path": "/get_language_metadata",
@@ -1873,7 +1873,7 @@
         "gui",
         "headless"
       ],
-      "description": "Get references from address"
+      "description": "Get outgoing references with resolved_address and in_memory_block; block names mapped memory. Check mapping before interpreting zero references."
     },
     {
       "path": "/get_xrefs_to",
@@ -1890,7 +1890,7 @@
         "gui",
         "headless"
       ],
-      "description": "Get references to address"
+      "description": "Get incoming references to one address or comma-separated addresses. Bulk results map each input to {references, count, resolved_address, in_memory_block, block}, or {address, error} for an invalid input. An unmapped address is distinct from a mapped address with no references."
     },
     {
       "path": "/import_data_types",
@@ -2652,7 +2652,7 @@
         "gui",
         "headless"
       ],
-      "description": "Search for byte patterns"
+      "description": "Search memory for hex bytes with nibble wildcards (?5, D?, ??). Rejects malformed patterns. Returns matches/count/total/truncated and coverage counters, including unreadable blocks."
     },
     {
       "path": "/search_instructions",

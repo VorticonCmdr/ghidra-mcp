@@ -118,7 +118,7 @@ public class SharedProjectLocatorTest extends TestCase {
         }
     }
 
-    public void testResolveProjectDirOverrideIsContainmentChecked() {
+    public void testResolveProjectDirOverrideIsContainmentChecked() throws Exception {
         SharedProjectLocator.Parsed p =
                 SharedProjectLocator.parseServerUrl("ghidra://127.0.0.1:13100/firmware-shared");
         SecurityConfig security = SecurityConfig.getInstance();
@@ -131,7 +131,7 @@ public class SharedProjectLocatorTest extends TestCase {
         // pre-push `./gradlew test` failed on every Windows machine.
         Path tmp = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath();
         if (!security.hasFileRoot()) {
-            Path root = tmp.resolve("ghidra-mcp-shared-test-root");
+            Path root = tmp.resolve("ghidra-mcp-shared-test-root").toFile().getCanonicalFile().toPath();
             Path dir = SharedProjectLocator.resolveProjectDir(p, root.toString(), security);
             assertEquals("127.0.0.1_13100_firmware-shared", dir.getFileName().toString());
             assertTrue(dir.startsWith(root));
