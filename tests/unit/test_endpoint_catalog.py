@@ -26,8 +26,13 @@ BRIDGE_PKG = PROJECT_ROOT / "python" / "bridge_mcp_ghidra"
 
 
 def _bridge_sources() -> list[Path]:
-    """All Python source files that make up the bridge package."""
-    return sorted(BRIDGE_PKG.glob("*.py"))
+    """All Python source files that make up the bridge package.
+
+    Recursive on purpose: a non-recursive glob would let a future
+    ``bridge_mcp_ghidra/foo/*.py`` subpackage silently escape the
+    per-module line cap.
+    """
+    return sorted(BRIDGE_PKG.rglob("*.py"))
 
 
 def _bridge_source_text() -> str:
@@ -164,20 +169,19 @@ class TestBridgeIsDynamic(unittest.TestCase):
         Management tools use @mcp.tool(); the WinDbg debugger proxy tools use
         @_debugger_tool() (registered conditionally — see _debugger_enabled).
         Every name in _ALL_STATIC_TOOL_NAMES must have exactly one decorator,
-        independent of which backends are active here.
+        independent of whether the debugger proxy is active here.
         """
         import bridge_mcp_ghidra as bridge
 
         content = _bridge_source_text()
         mgmt_count = len(re.findall(r"@mcp\.tool\([^\n]*\)", content))
-        debugger_count = len(re.findall(r"@_debugger_tool\(\)", content))
+        debugger_count = len(re.findall(r"@_debugger_tool\([^\n]*\)", content))
         tool_count = mgmt_count + debugger_count
         self.assertEqual(
             tool_count,
             len(bridge._ALL_STATIC_TOOL_NAMES),
             f"Bridge has {mgmt_count} @mcp.tool(...) + {debugger_count} "
-            f"@_debugger_tool() decorators "
-            f"({tool_count}) but {len(bridge._ALL_STATIC_TOOL_NAMES)} static tool names",
+            f"@_debugger_tool() decorators ({tool_count}) but {len(bridge._ALL_STATIC_TOOL_NAMES)} static tool names",
         )
         self.assertEqual(
             mgmt_count,

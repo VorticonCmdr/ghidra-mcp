@@ -35,7 +35,7 @@ public class ProgramScriptServiceValidationTest extends TestCase {
     }
 
     public void testOpenProgramFromProjectRequiresPath() {
-        Response r = scripts.openProgramFromProject("");
+        Response r = scripts.openProgramFromProject("", false);
         assertTrue(r instanceof Response.Err);
         assertTrue(((Response.Err) r).message().contains("Program path is required"));
     }
@@ -46,11 +46,23 @@ public class ProgramScriptServiceValidationTest extends TestCase {
         assertTrue(((Response.Err) r).message().contains("file_path is required"));
     }
 
-    public void testListProjectFilesRequiresGuiMode() {
-        // Stub provider exposes no PluginTool, so the GUI-only guard must fire.
+    public void testListProjectFilesRequiresProject() {
+        // Stub provider exposes no Project, so the project guard must fire.
         Response r = scripts.listProjectFiles("/");
         assertTrue(r instanceof Response.Err);
-        assertTrue(((Response.Err) r).message().contains("requires GUI mode"));
+        assertTrue(((Response.Err) r).message().contains("No project is currently open"));
+    }
+
+    public void testCreateFolderRequiresProject() {
+        Response r = scripts.createFolder("/test", "");
+        assertTrue(r instanceof Response.Err);
+        assertTrue(((Response.Err) r).message().contains("No project is currently open"));
+    }
+
+    public void testDeleteFileRequiresProject() {
+        Response r = scripts.deleteFile("/test.exe");
+        assertTrue(r instanceof Response.Err);
+        assertTrue(((Response.Err) r).message().contains("No project is currently open"));
     }
 
     public void testRunScriptInlineGatedByDefault() {
@@ -61,5 +73,18 @@ public class ProgramScriptServiceValidationTest extends TestCase {
             assertTrue(r instanceof Response.Err);
             assertTrue(((Response.Err) r).message().contains("Script execution disabled"));
         }
+    }
+
+    public void testSetMemoryBlockNeedsSomethingToChange() {
+        Response r = scripts.setMemoryBlock("ram", "", null, null, null, null, "");
+        assertTrue(r instanceof Response.Err);
+        assertTrue(((Response.Err) r).message().contains("nothing to change"));
+    }
+
+    public void testSetMemoryBlockNeedsExactlyOneOfBlockAndAddress() {
+        Response neither = scripts.setMemoryBlock("", "", null, false, null, null, "");
+        Response both = scripts.setMemoryBlock("ram", "0x08005000", null, false, null, null, "");
+        assertTrue(((Response.Err) neither).message().contains("exactly one of block or address"));
+        assertTrue(((Response.Err) both).message().contains("exactly one of block or address"));
     }
 }

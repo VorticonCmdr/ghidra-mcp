@@ -5,6 +5,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -36,9 +37,41 @@ public class AnnotationScanner {
     private static final Logger LOG = Logger.getLogger(AnnotationScanner.class.getName());
     private static final String NO_DEFAULT = Param.NO_DEFAULT;
 
+    /**
+     * Fallback used only by the constructors that predate {@link ThreadingStrategy}
+     * support (kept so existing callers and offline test fixtures compile
+     * unchanged). Runs directly on the calling thread with no EDT dispatch and
+     * no locking -- adequate for single-threaded offline scanning, never used
+     * by the real plugin or headless server, both of which always pass their
+     * own strategy through the three-argument constructor below.
+     */
+    private static final ThreadingStrategy DIRECT_NO_LOCK = new ThreadingStrategy() {
+        @Override
+        public <T> T executeRead(Callable<T> action) throws Exception {
+            return action.call();
+        }
+
+        @Override
+        public <T> T executeWrite(Program program, String txName, Callable<T> action) throws Exception {
+            if (program == null) {
+                throw new IllegalArgumentException("Program cannot be null for write operations");
+            }
+            int tx = program.startTransaction(txName);
+            boolean success = false;
+            try {
+                T result = action.call();
+                success = true;
+                return result;
+            } finally {
+                program.endTransaction(tx, success);
+            }
+        }
+    };
+
     private final List<EndpointDef> endpoints = new ArrayList<>();
     private final List<ToolDescriptor> descriptors = new ArrayList<>();
     private final ProgramProvider programProvider;
+    private final ThreadingStrategy threadingStrategy;
 
     /**
      * Scan the given service instances for {@link McpTool}-annotated methods.
@@ -46,7 +79,7 @@ public class AnnotationScanner {
      * @param services service objects to scan (e.g., ListingService, FunctionService, ...)
      */
     public AnnotationScanner(Object... services) {
-        this(null, services);
+        this(null, DIRECT_NO_LOCK, services);
     }
 
     /**
@@ -56,13 +89,35 @@ public class AnnotationScanner {
      * @param services        service objects to scan
      */
     public AnnotationScanner(ProgramProvider programProvider, Object... services) {
+        this(programProvider, DIRECT_NO_LOCK, services);
+    }
+
+    /**
+     * Scan the given service instances for {@link McpTool}-annotated methods.
+     *
+     * @param programProvider  provider for resolving programs (enables dry-run support)
+     * @param threadingStrategy strategy the dry-run wrapper uses to run the wrapped
+     *                          write on the same thread Ghidra's own threading model
+     *                          requires (the Swing EDT in GUI mode); pass the same
+     *                          instance the scanned services themselves were built
+     *                          with, e.g. {@link SwingThreadingStrategy}
+     * @param services          service objects to scan
+     */
+    public AnnotationScanner(ProgramProvider programProvider, ThreadingStrategy threadingStrategy,
+            Object... services) {
         this.programProvider = programProvider;
+        this.threadingStrategy = threadingStrategy != null ? threadingStrategy : DIRECT_NO_LOCK;
         for (Object service : services) {
             scanService(service);
         }
         // Sort by path for deterministic ordering
         endpoints.sort(Comparator.comparing(EndpointDef::path));
         descriptors.sort(Comparator.comparing(ToolDescriptor::path));
+    }
+
+    /** The provider every scanned endpoint resolves programs through; null for a bare scanner. */
+    public ProgramProvider getProgramProvider() {
+        return programProvider;
     }
 
     /** Returns all discovered endpoints. */
@@ -86,6 +141,28 @@ public class AnnotationScanner {
      * dynamic tool discovery) instead of being live-but-invisible.
      */
     public void addManualDescriptor(ToolDescriptor descriptor) {
+        // A path is advertised once. Adding the same manual list twice listed every
+        // hand-coded route twice in /mcp/schema. Where a route is both annotated and
+        // hand-described -- the catalog regenerator scans both servers' services in one
+        // bag, and /open_project is annotated headless but hand-coded with two extra
+        // GUI parameters -- the annotated descriptor stays and gains whatever
+        // parameters only the other one declares, so neither server's are lost.
+        for (int i = 0; i < descriptors.size(); i++) {
+            ToolDescriptor existing = descriptors.get(i);
+            if (!existing.path().equals(descriptor.path())) {
+                continue;
+            }
+            List<ParamDescriptor> merged = new ArrayList<>(existing.params());
+            Set<String> names = new HashSet<>();
+            for (ParamDescriptor p : merged) names.add(p.name());
+            for (ParamDescriptor p : descriptor.params()) {
+                if (names.add(p.name())) merged.add(p);
+            }
+            descriptors.set(i, new ToolDescriptor(existing.path(), existing.method(),
+                existing.description(), existing.category(), existing.categoryDescription(),
+                existing.access(), merged));
+            return;
+        }
         descriptors.add(descriptor);
         descriptors.sort(Comparator.comparing(ToolDescriptor::path));
     }
@@ -162,6 +239,9 @@ public class AnnotationScanner {
             McpTool tool, ParamBinding[] bindings) {
         boolean isWrite = "POST".equalsIgnoreCase(tool.method());
         return (query, body) -> {
+            // Pooled HTTP threads: clear on entry so a prior request that somehow
+            // skipped its finally cannot stamp this response with a stale program.
+            ServiceUtils.clearResolvedProgramName();
             try {
                 Object[] args = new Object[bindings.length];
                 for (int i = 0; i < bindings.length; i++) {
@@ -178,20 +258,58 @@ public class AnnotationScanner {
                 // rollback branch never ran and every dry_run body param fell through to
                 // method.invoke(...) unguarded. Confirmed live 2026-08-09 on /batch_set_comments
                 // (see reference_dry_run_silently_writes.md).
+                if (isWrite && isDryRunRequested(query, body) && !tool.dryRun()
+                        && !declaresParam(bindings, "dry_run")) {
+                    return Response.err("dry_run is not supported by " + tool.path() + ": its effect "
+                        + "is not a change to the program database (it saves, closes, checks in, or "
+                        + "works on files, the server or another service), so a rollback could not undo "
+                        + "it. Nothing was done.");
+                }
                 if (isWrite && isDryRunRequested(query, body) && programProvider != null) {
-                    Program program = resolveProgramForDryRun(bindings, query);
+                    Program program = resolveProgramForDryRun(bindings, query, body);
                     if (program != null) {
-                        int tx = program.startTransaction("[DRY RUN] " + tool.path());
-                        try {
-                            Response result = (Response) method.invoke(service, args);
-                            return wrapDryRunResponse(result);
-                        } finally {
-                            program.endTransaction(tx, false); // Always rollback
+                        // Ghidra nests by counting entries on ONE transaction, so an inner
+                        // rollback aborts the whole thing — with an ambient transaction open,
+                        // "undo just my part" is not something this can honour, and trying
+                        // would silently discard the outer owner's work. Refuse instead:
+                        // a clear error beats destroying an in-progress edit or script run.
+                        if (program.getCurrentTransactionInfo() != null) {
+                            return Response.err("dry_run cannot run while another transaction is "
+                                + "open on " + program.getName() + " (a GUI edit or a script). Its "
+                                + "rollback would abort that transaction too. Retry once the "
+                                + "in-progress operation finishes.");
                         }
+                        // The transaction must be opened on the same thread Ghidra's
+                        // threading model actually runs the write on -- the Swing EDT
+                        // in GUI mode. Opening it directly here left it on the calling
+                        // HTTP thread, while the wrapped service method's own
+                        // threadingStrategy.executeWrite dispatched the real work to
+                        // the EDT through a SEPARATE SwingUtilities.invokeAndWait,
+                        // nesting a transaction opened by one thread inside one opened
+                        // by another. That mismatched-thread nesting threw its own
+                        // ConcurrentModificationException on every dry run, independent
+                        // of any bug in the wrapped method itself. Routing the whole
+                        // thing through executeWrite keeps every transaction on one
+                        // thread: the service method's own executeWrite call sees it is
+                        // already on the EDT and just nests its transaction in place,
+                        // no second dispatch.
+                        return threadingStrategy.executeWrite(program, "[DRY RUN] " + tool.path(), () -> {
+                            int tx = program.startTransaction("[DRY RUN] " + tool.path());
+                            try {
+                                // Inject before dry-run wrap so the program label survives
+                                // the Text conversion; wrapDryRun prefixes into the same object.
+                                Response result = injectResolvedProgram(
+                                        (Response) method.invoke(service, args));
+                                return wrapDryRunResponse(result);
+                            } finally {
+                                program.endTransaction(tx, false); // Always rollback
+                            }
+                        });
                     }
                 }
 
-                return (Response) method.invoke(service, args);
+                Response result = injectResolvedProgram((Response) method.invoke(service, args));
+                return isWrite && tool.dryRun() ? warnIfUnsaveable(result) : result;
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause();
                 String msg = cause != null ? cause.getMessage() : e.getMessage();
@@ -200,8 +318,102 @@ public class AnnotationScanner {
             } catch (Exception e) {
                 LOG.log(Level.WARNING, "Invocation error for " + tool.path() + ": " + e.getMessage(), e);
                 return Response.err("Error invoking " + tool.path() + ": " + e.getMessage());
+            } finally {
+                ServiceUtils.clearResolvedProgramName();
             }
         };
+    }
+
+    /**
+     * Append a warning to a successful program edit that can never be saved. The edit
+     * applied, so the response is right to say success; what it does not say is that the
+     * edit lives only in memory, because the program is an in-memory copy of a versioned
+     * file that is not checked out ({@link ProgramSaves#unsaveableReason}). Without this, every edit reported success
+     * and the loss surfaced only at close.
+     */
+    static Response warnIfUnsaveable(Response response) {
+        Program program = ServiceUtils.peekResolvedProgram();
+        if (program == null || !(response instanceof Response.Ok ok)
+                || !(ok.data() instanceof Map<?, ?> map) || !program.isChanged()) {
+            return response;
+        }
+        String reason = ProgramSaves.unsaveableReason(program);
+        if (reason == null) {
+            return response;
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            out.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        List<Object> warnings = new ArrayList<>();
+        Object existing = out.get("warnings");
+        if (existing instanceof Collection<?> c) {
+            warnings.addAll(c);
+        } else if (existing != null) {
+            warnings.add(existing);
+        }
+        warnings.add(reason);
+        out.put("warnings", warnings);
+        return Response.ok(out);
+    }
+
+    /**
+     * Stamp {@code "program": "<resolved>"} on object payloads that do not already
+     * name their subject. Skip Text/array/scalar and never overwrite
+     * {@code program}/{@code program_name} — get_metadata and get_function_count
+     * already speak for themselves.
+     */
+    static Response injectResolvedProgram(Response response) {
+        String name = ServiceUtils.peekResolvedProgramName();
+        if (name == null || name.isEmpty() || response == null) {
+            return response;
+        }
+        if (!(response instanceof Response.Ok ok)) {
+            return response;
+        }
+        Object data = ok.data();
+        if (data instanceof Map<?, ?> map) {
+            if (map.containsKey("program") || map.containsKey("program_name")) {
+                return response;
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("program", name);
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                out.put(String.valueOf(e.getKey()), e.getValue());
+            }
+            return Response.ok(out);
+        }
+        if (data == null
+                || data instanceof CharSequence
+                || data instanceof Number
+                || data instanceof Boolean
+                || data instanceof Collection
+                || data.getClass().isArray()) {
+            return response;
+        }
+        // Non-Map objects that still serialize as JSON objects (rare).
+        String json = response.toJson();
+        if (json == null || !json.startsWith("{")) {
+            return response;
+        }
+        Map<String, Object> parsed = JsonHelper.parseJson(json);
+        if (parsed.containsKey("program") || parsed.containsKey("program_name")) {
+            return response;
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("program", name);
+        out.putAll(parsed);
+        return Response.ok(out);
+    }
+
+    /** A tool that takes {@code dry_run} itself implements its own preview. */
+    private static boolean declaresParam(ParamBinding[] bindings, String name) {
+        for (ParamBinding b : bindings) {
+            if (b != null && b.param != null && name.equals(b.param.value())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -221,11 +433,19 @@ public class AnnotationScanner {
     /**
      * Resolve the Program for dry-run wrapping by finding the "program" param binding.
      */
-    private Program resolveProgramForDryRun(ParamBinding[] bindings, Map<String, String> query) {
+    private Program resolveProgramForDryRun(ParamBinding[] bindings, Map<String, String> query,
+            Map<String, Object> body) {
         // Look for a @Param(value = "program") binding
         for (ParamBinding binding : bindings) {
             if (binding != null && "program".equals(binding.param.value())) {
+                // Query first, then body -- a POST caller following this project's
+                // "POST params go in the body" convention puts it there, and reading
+                // only the query made a dry run preview the wrong program.
                 String programName = query.get("program");
+                if (programName == null || programName.isEmpty()) {
+                    Object raw = body != null ? body.get("program") : null;
+                    if (raw != null) programName = String.valueOf(raw);
+                }
                 if (programName != null && !programName.isEmpty()) {
                     return programProvider.getProgram(programName);
                 }
@@ -252,13 +472,55 @@ public class AnnotationScanner {
     // Parameter resolution
     // ==================================================================
 
-    private static Object resolveParam(ParamBinding binding, Map<String, String> query,
+    /**
+     * Resolve a parameter from its declared source, falling back to the other one
+     * when the declared source does not carry it at all.
+     *
+     * {@link Param#source()} defaults to {@link ParamSource#QUERY}. On a POST tool
+     * that declares its other parameters as BODY, any parameter left at the default
+     * -- {@code program} on 192 declarations across 103 POST tools -- is therefore
+     * looked for in the query string and silently missed when the caller puts it in
+     * the JSON body alongside everything else. For {@code program} the consequence
+     * is not a missing argument but a WRONG TARGET: resolution falls through to the
+     * current program, so a bookmark, comment or rename addressed to one program
+     * lands in whichever program happens to be active, and the response says
+     * success. That is how 16442 bookmarks describing one DLL were written into
+     * a different DLL without a single error.
+     *
+     * This generalises what {@code isDryRunRequested} already does by hand for
+     * {@code dry_run}, and for the same reason it gives: the Python bridge
+     * synthesizes query params while a direct-HTTP caller follows this project's
+     * own "POST params go in the body" convention. Both are legitimate; a parameter
+     * should be found wherever the caller put it.
+     *
+     * The declared source still wins when it has a value, so nothing that works
+     * today changes meaning.
+     */
+    static Object resolveParam(ParamBinding binding, Map<String, String> query,
             Map<String, Object> body) {
-        if (binding.param.source() == ParamSource.QUERY) {
-            return resolveQueryParam(binding, query);
-        } else {
-            return resolveBodyParam(binding, body);
+        boolean declaredQuery = binding.param.source() == ParamSource.QUERY;
+        boolean inDeclared = declaredQuery ? presentIn(binding, query) : presentIn(binding, body);
+        if (!inDeclared) {
+            boolean inOther = declaredQuery ? presentIn(binding, body) : presentIn(binding, query);
+            if (inOther) {
+                return declaredQuery ? resolveBodyParam(binding, body)
+                                     : resolveQueryParam(binding, query);
+            }
         }
+        return declaredQuery ? resolveQueryParam(binding, query)
+                             : resolveBodyParam(binding, body);
+    }
+
+    /** Whether a map actually carries this parameter, under its name or any alias. */
+    static boolean presentIn(ParamBinding binding, Map<String, ?> values) {
+        if (values == null || values.isEmpty()) return false;
+        if (values.containsKey(binding.param.value())) return true;
+        if (binding.aliases != null) {
+            for (String alias : binding.aliases) {
+                if (values.containsKey(alias)) return true;
+            }
+        }
+        return false;
     }
 
     private static Object resolveQueryParam(ParamBinding binding, Map<String, String> query) {
@@ -300,7 +562,11 @@ public class AnnotationScanner {
 
         } else if (type == Boolean.class) {
             if (value == null || value.isEmpty()) {
-                return hasDef ? Boolean.valueOf(def) : null;
+                // An EMPTY defaultValue means "no default" for a nullable tri-state
+                // filter, exactly as the String/Integer branches above treat it.
+                // Boolean.valueOf("") is false, so returning it here would turn an
+                // OMITTED filter into an active "== false" filter.
+                return (hasDef && !def.isEmpty()) ? Boolean.valueOf(def) : null;
             }
             return Boolean.parseBoolean(value);
 
@@ -369,7 +635,9 @@ public class AnnotationScanner {
 
         } else if (type == Boolean.class) {
             if (raw == null) {
-                return hasDef ? Boolean.valueOf(def) : null;
+                // See the note in the query-string coercion above: an empty
+                // defaultValue means "unset", not "false".
+                return (hasDef && !def.isEmpty()) ? Boolean.valueOf(def) : null;
             }
             if (raw instanceof Boolean b) return b;
             return Boolean.parseBoolean(String.valueOf(raw));
@@ -446,11 +714,15 @@ public class AnnotationScanner {
                 NO_DEFAULT.equals(binding.param.defaultValue()) ? null : binding.param.defaultValue(),
                 binding.param.description(),
                 binding.param.paramType(),
-                binding.param.allowEmpty()
+                binding.param.allowEmpty(),
+                // Declared alternative spellings. resolveQueryParam / resolveBodyParam
+                // already accept these; publishing them is what lets a schema-driven
+                // client know that, instead of calling a valid spelling unknown.
+                binding.aliases == null ? List.of() : List.of(binding.aliases)
             ));
         }
         return new ToolDescriptor(tool.path(), tool.method(), tool.description(),
-            category, categoryDescription, params);
+            category, categoryDescription, tool.access(), params);
     }
 
     private static String jsonType(Class<?> type, boolean fieldsJson) {
@@ -471,7 +743,8 @@ public class AnnotationScanner {
 
     /** Describes an MCP tool for schema generation. */
     public record ToolDescriptor(String path, String method, String description,
-            String category, String categoryDescription, List<ParamDescriptor> params) {
+            String category, String categoryDescription, ToolAccess access,
+            List<ParamDescriptor> params) {
 
         /** Serialize to JSON. */
         public String toJson() {
@@ -487,6 +760,13 @@ public class AnnotationScanner {
             if (categoryDescription != null && !categoryDescription.isEmpty()) {
                 sb.append(", \"category_description\": ").append(jsonStr(categoryDescription));
             }
+            // Emitted only when classified, so an unclassified tool carries no
+            // hints and the client keeps its own defaults. The bridge turns
+            // these into MCP's readOnlyHint / destructiveHint annotations.
+            if (access != null && access != ToolAccess.UNSPECIFIED) {
+                sb.append(", \"read_only\": ").append(access.isReadOnly());
+                sb.append(", \"destructive\": ").append(access.isDestructive());
+            }
             sb.append(", \"params\": [");
             for (int i = 0; i < params.size(); i++) {
                 if (i > 0) sb.append(", ");
@@ -497,10 +777,31 @@ public class AnnotationScanner {
         }
     }
 
-    /** Describes a tool parameter for schema generation. */
+    /**
+     * Describes a tool parameter for schema generation.
+     *
+     * <p>{@code aliases} are the alternative spellings the runtime resolver accepts
+     * for this parameter (see {@link Param#aliases()}). They are part of the public
+     * contract -- the server genuinely serves them -- so they belong in /mcp/schema.
+     * Before 7.0.0 they were honoured at dispatch but never published, so the schema
+     * understated what the server accepts and any schema-driven client or checker
+     * treated a valid spelling as an unknown parameter.
+     */
     public record ParamDescriptor(String name, String type, String source,
             boolean optional, String defaultValue, String description, String paramType,
-            boolean allowEmpty) {
+            boolean allowEmpty, List<String> aliases) {
+
+        /** Normalize {@code aliases} so no caller has to hand in a non-null list. */
+        public ParamDescriptor {
+            aliases = (aliases == null) ? List.of() : List.copyOf(aliases);
+        }
+
+        /** Back-compat overload for callers predating the {@code aliases} component. */
+        public ParamDescriptor(String name, String type, String source, boolean optional,
+                String defaultValue, String description, String paramType, boolean allowEmpty) {
+            this(name, type, source, optional, defaultValue, description, paramType,
+                 allowEmpty, List.of());
+        }
 
         /** Serialize to JSON. */
         public String toJson() {
@@ -517,6 +818,16 @@ public class AnnotationScanner {
             }
             if (paramType != null && !paramType.isEmpty()) {
                 sb.append(", \"param_type\": ").append(jsonStr(paramType));
+            }
+            // Only emitted when the parameter actually declares alternatives, so the
+            // 200-odd tools that declare none keep byte-identical schema output.
+            if (aliases != null && !aliases.isEmpty()) {
+                sb.append(", \"aliases\": [");
+                for (int i = 0; i < aliases.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(jsonStr(aliases.get(i)));
+                }
+                sb.append("]");
             }
             // Only emitted when true: the bridge drops "" arguments unless a
             // parameter declares that empty carries meaning.
@@ -537,9 +848,30 @@ public class AnnotationScanner {
     // Internal binding record
     // ==================================================================
 
-    private record ParamBinding(Param param, Class<?> javaType, String[] aliases) {
+    /** Package-private so AnnotationScannerParamSourceTest can build one directly. */
+    record ParamBinding(Param param, Class<?> javaType, String[] aliases) {
         ParamBinding(Param param, Class<?> javaType) {
-            this(param, javaType, param.aliases());
+            this(param, javaType, effectiveAliases(param));
         }
     }
+
+    /** The spellings a {@link Param#FUNCTION_REF} parameter accepts besides its own name. */
+    private static final List<String> FUNCTION_REF_ALIASES =
+        List.of("address", "name", "function_address", "function_name", "function");
+
+    /**
+     * The alias spellings of a parameter: those it declares, plus, for a function
+     * reference, the standard set. Declared once here instead of on the 26 endpoints that
+     * used to repeat the list, in two different orders.
+     */
+    static String[] effectiveAliases(Param param) {
+        if (!Param.FUNCTION_REF.equals(param.paramType())) {
+            return param.aliases();
+        }
+        Set<String> all = new LinkedHashSet<>(List.of(param.aliases()));
+        all.addAll(FUNCTION_REF_ALIASES);
+        all.remove(param.value());
+        return all.toArray(new String[0]);
+    }
 }
+

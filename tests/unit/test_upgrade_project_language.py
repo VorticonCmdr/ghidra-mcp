@@ -1,4 +1,4 @@
-"""Unit tests for scripts/upgrade_project_language.py.
+"""Unit tests for tools/upgrade_project_language.py.
 
 Pure Python -- no Ghidra, no server, no subprocess. Every behaviour pinned here
 is one that produced a silent wrong answer during development:
@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = REPO_ROOT / "scripts" / "upgrade_project_language.py"
+MODULE_PATH = REPO_ROOT / "tools" / "upgrade_project_language.py"
 
 
 def _load():
@@ -133,11 +133,14 @@ def test_no_private_destination_is_baked_into_the_module():
 def test_server_and_repo_come_from_the_live_instance(monkeypatch, tmp_path):
     monkeypatch.setattr(
         upl, "mcp_get",
-        lambda base, endpoint, **kw: {"project": "someproj", "server_info": "host.example:13100"},
+        lambda base, endpoint, **kw: {"project_name": "local-name", "server_repo": "someproj",
+                                      "server_info": "host.example:13100"},
     )
     server, repo, origin = upl.resolve_server_and_repo("http://x", tmp_path, None, None)
+    # The repository, not the local project's name: the two differ whenever the
+    # project was created under another name than the repo it binds to.
     assert (server, repo) == ("host.example:13100", "someproj")
-    assert "project/info" in origin
+    assert "get_project_info" in origin
 
 
 def test_explicit_flags_win_over_discovery(monkeypatch, tmp_path):
