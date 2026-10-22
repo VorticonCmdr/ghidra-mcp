@@ -1,12 +1,12 @@
 package com.xebyte.core;
 
 import com.xebyte.headless.DirectThreadingStrategy;
-import com.xebyte.headless.HeadlessProgramProvider;
 import ghidra.GhidraApplicationLayout;
 import ghidra.framework.Application;
 import ghidra.framework.ApplicationConfiguration;
 import ghidra.program.database.ProgramBuilder;
 import ghidra.program.database.ProgramDB;
+import ghidra.program.model.listing.Program;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -19,16 +19,7 @@ import java.util.Map;
 import static org.junit.Assert.*;
 import static org.junit.Assume.assumeTrue;
 
-/**
- * Regression coverage for decompile_function's bulk mode (functions=...), scoped to the two
- * defects actually fixed: silent truncation past MAX_FUNCTIONS, and per-function failures
- * reported as ordinary string values ("Error: ...") indistinguishable from real decompiled
- * code. Deliberately does not exercise a successful decompile - that path reuses the same
- * {name, address, decompiled} fields single-mode decompileFunctionByAddress already emits
- * unchanged, and this repo has no existing test that invokes the real decompiler backend to
- * build on; these assertions target the envelope logic itself (which needs no decompile to
- * reach), not decompiler correctness.
- */
+/** Bulk function reads retain typed errors and report all requested entries, including truncation. */
 public class FunctionServiceBulkDecompileGhidraTest {
 
     private ProgramBuilder builder;
@@ -69,28 +60,32 @@ public class FunctionServiceBulkDecompileGhidraTest {
         return (Map<String, Object>) data;
     }
 
-    private FunctionService service() {
-        HeadlessProgramProvider provider = new HeadlessProgramProvider();
-        provider.setCurrentProgram(program);
-        return new FunctionService(provider, new DirectThreadingStrategy());
+    private FunctionBundleService service() {
+        ProgramProvider provider = new ProgramProvider() {
+            @Override public Program getCurrentProgram() { return program; }
+            @Override public Program getProgram(String name) { return program; }
+            @Override public Program[] getAllOpenPrograms() { return new Program[] {program}; }
+            @Override public void setCurrentProgram(Program p) { }
+        };
+        return new FunctionBundleService(provider, new DirectThreadingStrategy(),
+            new FunctionService(provider, new DirectThreadingStrategy()));
     }
 
     @Test
     @SuppressWarnings("unchecked")
     public void unresolvedFunctionReportsAnErrorRowNotAnErrorString() {
-        Map<String, Object> b = body(service().batchDecompileFunctions("does_not_exist", ""));
+        Map<String, Object> b = body(service().getFunctions("", "does_not_exist", "signature", false, 6, 3, false, "", ""));
 
-        assertEquals(1, b.get("count"));
+        assertEquals(0, b.get("count"));
+        assertEquals(1, b.get("requested"));
         assertEquals(1, b.get("total"));
         assertEquals(false, b.get("truncated"));
         assertFalse("no truncation happened - there must be no truncation_note",
             b.containsKey("truncation_note"));
 
-        List<Map<String, Object>> results = (List<Map<String, Object>>) b.get("results");
+        Map<String, Object> results = (Map<String, Object>) b.get("functions");
         assertEquals(1, results.size());
-        Map<String, Object> row = results.get(0);
-        assertEquals("does_not_exist", row.get("function"));
-        assertEquals("error", row.get("status"));
+        Map<String, Object> row = (Map<String, Object>) results.get("does_not_exist");
         assertTrue("error row must carry an 'error' key, not a bare 'Error: ...' string value "
                 + "under a generic key - this is the exact regression being guarded against",
             row.get("error") instanceof String);
@@ -109,22 +104,23 @@ public class FunctionServiceBulkDecompileGhidraTest {
             refs.append("nonexistent_").append(i);
         }
 
-        Map<String, Object> b = body(service().batchDecompileFunctions(refs.toString(), ""));
+        Map<String, Object> b = body(service().getFunctions("", refs.toString(), "signature", false, 6, 3, false, "", ""));
 
         assertEquals("total must reflect everything requested, even the part dropped",
             25, b.get("total"));
         assertEquals("results must stop at MAX_FUNCTIONS, not silently continue or silently "
-                + "stop short", 20, b.get("count"));
+                + "stop short", 20, b.get("requested"));
+        assertEquals(0, b.get("count"));
         assertEquals(true, b.get("truncated"));
         assertTrue("a truncated batch must explain itself", b.containsKey("truncation_note"));
 
-        List<Map<String, Object>> results = (List<Map<String, Object>>) b.get("results");
+        Map<String, Object> results = (Map<String, Object>) b.get("functions");
         assertEquals(20, results.size());
     }
 
     @Test
     public void emptyFunctionsParameterIsRejectedUpFront() {
-        Response r = service().batchDecompileFunctions("", "");
+        Response r = service().getFunctions("", "", "signature", false, 6, 3, false, "", "");
         assertTrue(r.toJson(), r instanceof Response.Err);
     }
 }
